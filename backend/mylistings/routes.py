@@ -1,0 +1,297 @@
+from datetime import datetime, timedelta
+
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required
+
+from extensions import db
+from models import Product, EmiApplication, Purchase, PurchaseUser, User
+from models.product import normalize_show_phone, SHOW_PHONE_NO
+from utils import current_user, has_staff_access
+
+bp = Blueprint("mylistings", __name__, url_prefix="/api/my-listings")
+
+# Fields the owner (or staff) is allowed to change via the edit endpoint.
+EDITABLE_FIELDS = [
+    "title", "category", "condition", "price", "original_price",
+    "negotiable", "emi_eligible", "description", "image_url", "extra_images",
+    "show_phone", "location", "city", "landmark", "brand", "model", "status"
+]
+
+# Statuses a seller may set through the edit endpoint. "reserved" is set only
+# by a DealLock deal, and anything else was never a real status - before
+# this list, any string was saved as-is.
+OWNER_SETTABLE_STATUSES = ("active", "sold", "removed")
+
+
+@bp.route("", methods=["GET"])
+@jwt_required()
+def get_my_listings():
+    """The current user's listings — active and sold, but not deleted ones.
+
+    Deleting a listing sets status='removed' rather than deleting the row,
+    because messages, purchases and EMI applications all reference
+    product_id and would be orphaned by a real DELETE. The row therefore
+    has to survive; it just shouldn't keep appearing here, where a seller
+    who deleted something reasonably expects it to be gone.
+
+    Pass ?include_removed=1 to get them back — nothing is lost, only
+    hidden by default. Admins still see every status in the admin panel.
+    """
+    user = current_user()
+    q = Product.query.filter_by(posted_by=user.id)
+    if request.args.get("include_removed") not in ("1", "true", "yes"):
+        q = q.filter(Product.status != "removed")
+    products = q.order_by(Product.created_at.desc()).all()
+    # DealLock: lets My Listings show "View deal" (not Edit/Delete) for a
+    # listing in any live deal, including one not yet marked reserved.
+    from deals.service import deal_stage_for_products
+    from deals.listing_docs import states_for
+    stages = deal_stage_for_products(products)
+    # DealLock phase 5: the listing's documents (cars and bikes): none,
+    # needed, checking or verified. Drives the badge and "Add documents".
+    docs = states_for(products)
+    out = []
+    for p in products:
+        d = p.to_dict()
+        d["deal_stage"] = stages.get(p.id)
+        d["docs_state"] = docs.get(p.id, "none")
+        out.append(d)
+    return jsonify(out)
+
+
+@bp.route("/<pid>", methods=["GET"])
+@jwt_required()
+def get_my_listing(pid):
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify(p.to_dict())
+
+
+@bp.route("/<pid>", methods=["PUT"])
+@jwt_required()
+def update_my_listing(pid):
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+
+    data = request.get_json() or {}
+    # An edit may leave description out (e.g. mark sold), but can't blank it.
+    if "description" in data and not str(data.get("description") or "").strip():
+        return jsonify({"error": "Please add a description."}), 400
+
+    # DealLock: a reserved listing's status belongs to its deal.
+    outbox = None
+    if "status" in data and data["status"] != p.status:
+        from deals.service import Outbox, guard_listing_status_change
+        by_staff = p.posted_by != user.id
+        if data["status"] not in OWNER_SETTABLE_STATUSES and not by_staff:
+            return jsonify({"error": "That isn't a status you can set."}), 400
+        outbox = Outbox()
+        problem = guard_listing_status_change(p, data["status"], user, by_staff, outbox)
+        if problem:
+            db.session.rollback()
+            return jsonify({"error": problem}), 409
+    for field in EDITABLE_FIELDS:
+        if field in data:
+            if field == "extra_images":
+                setattr(p, field, ",".join(data[field]) if data[field] else None)
+            elif field == "show_phone":
+                value = normalize_show_phone(data[field])
+                owner = User.query.get(p.posted_by) if p.posted_by else None
+                if owner is not None and owner.show_phone is False:
+                    value = SHOW_PHONE_NO
+                p.show_phone = value
+            else:
+                setattr(p, field, data[field])
+
+    # Same fallback as listing creation: if the seller clears the location
+    # (or edits the pincode without touching it), fill it from the pincode's
+    # district/state rather than leaving a bare six-digit number on display.
+    if not (p.location or "").strip():
+        from sell.routes import resolve_place_from_pincode
+        p.location = resolve_place_from_pincode(p.city)
+
+    # Editing must update attributes too, or a corrected year/km stays
+    # wrong in search while looking right on the listing page.
+    if "attributes" in data:
+        from sell.routes import save_product_attributes
+        save_product_attributes(p, data.get("attributes") or {})
+
+    db.session.commit()
+    if outbox:
+        outbox.send()
+    return jsonify(p.to_dict())
+
+
+@bp.route("/<pid>/sell", methods=["POST"])
+@jwt_required()
+def sell_my_listing(pid):
+    """Owner marks their own listing as sold. Creates a Purchase (+
+    PurchaseUser rows for buyer/seller) so it shows up in sales history."""
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+
+    # DealLock: marking a reserved listing sold would abandon the buyer the
+    # deal is reserved for. The seller cancels the deal first (a strike);
+    # staff get the deal released for them.
+    from deals.service import Outbox, guard_listing_status_change
+    outbox = Outbox()
+    problem = guard_listing_status_change(p, "sold", user, p.posted_by != user.id, outbox)
+    if problem:
+        db.session.rollback()
+        return jsonify({"error": problem}), 409
+
+    data = request.get_json() or {}
+    buyer_email = data.get("buyer_email", "").strip().lower()
+    buyer = User.query.filter_by(email=buyer_email).first() if buyer_email else None
+
+    approved_emi = (
+        EmiApplication.query
+        .filter_by(product_id=p.id, status="approved")
+        .order_by(EmiApplication.applied_at.desc())
+        .first()
+    )
+
+    purchase = Purchase(
+        product_id=p.id,
+        emi_application_id=approved_emi.id if approved_emi else None,
+        total_amount=p.price,
+        payment_method="emi" if approved_emi else "full_payment",
+        status="completed"
+    )
+    db.session.add(purchase)
+    db.session.flush()  # get purchase.purchase_id before commit
+
+    if p.posted_by:
+        db.session.add(PurchaseUser(purchase_id=purchase.purchase_id, user_id=p.posted_by, role_in_purchase="seller"))
+    if buyer:
+        db.session.add(PurchaseUser(purchase_id=purchase.purchase_id, user_id=buyer.id, role_in_purchase="buyer"))
+
+    p.status = "sold"
+    db.session.commit()
+    outbox.send()
+    return jsonify(purchase.to_dict()), 201
+
+
+@bp.route("/<pid>/unsell", methods=["POST"])
+@jwt_required()
+def unsell_my_listing(pid):
+    """Undo an accidental "Mark Sold" — relists the item and removes the
+    purchase record that marking it created.
+
+    The purchase has to go, not just the status: leaving it behind would keep
+    counting toward sales history and the admin dashboard's revenue figure,
+    so the seller would relist an item that the site still believes sold.
+
+    Refused when the purchase is tied to an approved EMI application. That
+    is a real financing arrangement with a lender, and unwinding it is not
+    something a seller should be able to do from a button — staff have to
+    handle it. Everything else is a plain mistake and safe to reverse.
+    """
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+    if p.status != "sold":
+        return jsonify({"error": "This listing is not marked sold."}), 400
+
+    purchase = (Purchase.query
+                .filter_by(product_id=p.id)
+                .order_by(Purchase.created_at.desc())
+                .first())
+
+    if purchase and purchase.emi_application_id:
+        return jsonify({"error": "This sale is linked to an approved EMI "
+                                 "application and can't be undone here. "
+                                 "Please contact support."}), 409
+
+    if purchase:
+        PurchaseUser.query.filter_by(purchase_id=purchase.purchase_id).delete()
+        db.session.delete(purchase)
+
+    p.status = "active"
+    db.session.commit()
+    return jsonify(p.to_dict()), 200
+
+
+# How long a "Show at top" promotion lasts, by plan. Values are days.
+# Priced as a placeholder for now — billing is not wired up, so promoting is
+# free at this stage and the price shown in the UI is indicative only.
+FEATURE_PLANS = {
+    "3d": {"days": 3, "label": "3 days", "price": 49},
+    "7d": {"days": 7, "label": "7 days", "price": 99},
+    "15d": {"days": 15, "label": "15 days", "price": 179},
+    "30d": {"days": 30, "label": "30 days", "price": 299},
+}
+
+
+@bp.route("/plans", methods=["GET"])
+@jwt_required()
+def feature_plans():
+    """Promotion options, so the UI never hardcodes durations or prices."""
+    return jsonify([
+        {"code": k, "days": v["days"], "label": v["label"], "price": v["price"]}
+        for k, v in FEATURE_PLANS.items()
+    ])
+
+
+@bp.route("/<pid>/feature", methods=["POST"])
+@jwt_required()
+def feature_listing(pid):
+    """Promote a listing so it sorts above others in browse and search.
+
+    Extending an active promotion adds to the remaining time rather than
+    replacing it — otherwise a seller who renews early silently loses the
+    days they already paid for.
+    """
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+    if p.status != "active":
+        return jsonify({"error": "Only active listings can be promoted"}), 400
+
+    plan_code = (request.get_json() or {}).get("plan", "7d")
+    plan = FEATURE_PLANS.get(plan_code)
+    if not plan:
+        return jsonify({"error": f"Unknown plan '{plan_code}'"}), 400
+
+    now = datetime.utcnow()
+    base = p.featured_until if (p.featured_until and p.featured_until > now) else now
+    p.featured_until = base + timedelta(days=plan["days"])
+    if not p.featured_at:
+        p.featured_at = now
+
+    db.session.commit()
+    return jsonify(p.to_dict())
+
+
+@bp.route("/<pid>/feature", methods=["DELETE"])
+@jwt_required()
+def unfeature_listing(pid):
+    """Stop promoting a listing immediately."""
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+
+    p.featured_until = None
+    db.session.commit()
+    return jsonify(p.to_dict())

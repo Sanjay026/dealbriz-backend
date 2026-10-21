@@ -1,0 +1,173 @@
+import os
+from datetime import timedelta
+
+from flask import Flask, jsonify, redirect, request, send_from_directory
+from flask_cors import CORS
+
+from config import Config
+from errors import bp as logs_bp, register_error_handlers
+from extensions import db, jwt
+from logging_config import configure_logging
+from security import check_secrets, register_jwt_handlers
+
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+
+    # Behind an ALB the app sees the balancer's IP and http, not the
+    # client's IP and https. Without this, rate limiting and audit logs
+    # record the load balancer, and any url_for(_external=True) emits an
+    # http:// link that browsers then block as mixed content.
+    if os.environ.get("BEHIND_PROXY", "").lower() in ("1", "true", "yes"):
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+    configure_logging(app)
+    # Refuses to boot on placeholder signing keys outside debug mode.
+    check_secrets(app)
+
+    # Restrict origins in production via CORS_ORIGINS (comma-separated).
+    # "*" is fine for local development but means any site can call this API
+    # with a user's token, so it should be pinned before going live.
+    # Session cookies are sent with credentials:'include', and the browser
+    # REFUSES a wildcard Access-Control-Allow-Origin on such requests — the
+    # spec forbids "*" plus credentials. So origins must be listed
+    # explicitly; "*" here would break login entirely rather than being
+    # merely permissive.
+    #
+    # In the Docker/nginx setup the frontend and API share an origin, so
+    # CORS never engages. These values matter for local development and if
+    # the API is ever served from a separate domain.
+    raw = os.environ.get("CORS_ORIGINS", "").strip()
+    if raw and raw != "*":
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+    else:
+        # Development defaults. A wildcard is deliberately NOT used.
+        origins = [
+            "http://localhost:8080", "http://127.0.0.1:8080",
+            "http://localhost:5500", "http://127.0.0.1:5500",
+            "http://localhost:3000", "http://127.0.0.1:3000",
+        ]
+        if raw == "*":
+            app.logger.warning(
+                "CORS_ORIGINS='*' is not usable with cookie auth \u2014 falling back "
+                "to localhost defaults. Set it to your real domain before launch."
+            )
+
+    CORS(app,
+         resources={r"/api/*": {"origins": origins}},
+         supports_credentials=True,          # required for the session cookie
+         allow_headers=["Content-Type", "X-CSRF-TOKEN"],
+         expose_headers=["Content-Type"])
+    db.init_app(app)
+    jwt.init_app(app)
+    register_jwt_handlers(app, jwt)
+
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+    # Feature blueprints — one folder per area, matching backend/ToDo:
+    #   buy/          -> paginated + filtered listing, category browsing, search, product detail
+    #   sell/         -> create listing, image upload
+    #   mylistings/   -> the logged-in user's own listings (any status) + edit + mark sold
+    #   profile/      -> get/edit own profile, avatar, public user lookup (for chat)
+    #   saved/        -> saved/wishlist items
+    #   chat/         -> messaging between buyer and seller
+    #   emi/          -> buyer-facing EMI applications
+    #   financers/    -> public financing-partner directory
+    #   reports/      -> users reporting suspicious sellers
+    #   admin/        -> staff-only: users, products, purchases, financers, EMI review, reports
+    #   auth/         -> signup, login, session, password change
+    #   notifications/-> navbar bell feed + unread chat/notification counts
+    #   deals/        -> DealLock: offers in chat, locked deals, reservations
+    #   loans/        -> DealLock: the loan on a locked deal
+    #   lender/       -> DealLock: the lender (NBFC) portal
+    #   listingdocs/  -> DealLock: a listing's seller documents (phase 5)
+    from auth.routes import bp as auth_bp
+    from buy.routes import bp as buy_bp
+    from sell.routes import bp as sell_bp
+    from mylistings.routes import bp as mylistings_bp
+    from profile.routes import bp as profile_bp
+    from saved.routes import bp as saved_bp
+    from chat.routes import bp as chat_bp
+    from emi.routes import bp as emi_bp
+    from financers.routes import bp as financers_bp
+    from admin.routes import bp as admin_bp
+    from reports.routes import bp as reports_bp
+    from legal.routes import bp as legal_bp
+    from faqs.routes import bp as faqs_bp
+    from blog.routes import bp as blog_bp
+    from settings.routes import bp as settings_bp
+    from locations.routes import bp as locations_bp
+    from chatbot.routes import bp as chatbot_bp
+    from notifications.routes import bp as notifications_bp
+    from deals.routes import bp as deals_bp
+    from loans.routes import bp as loans_bp
+    from lender.routes import bp as lender_bp
+    from listingdocs.routes import bp as listing_docs_bp
+
+    for blueprint in (
+        auth_bp, buy_bp, sell_bp, mylistings_bp, profile_bp,
+        saved_bp, chat_bp, emi_bp, financers_bp, admin_bp, reports_bp, legal_bp, faqs_bp, blog_bp, settings_bp, logs_bp, locations_bp, chatbot_bp, notifications_bp, deals_bp, loans_bp, lender_bp,
+        listing_docs_bp
+    ):
+        app.register_blueprint(blueprint)
+
+    @app.route("/uploads/<filename>")
+    def serve_upload(filename):
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+    @app.route("/api/health")
+    def health():
+        """Liveness + readiness for Docker/orchestrators. Actually touches the
+        database, because a process that is running but can't reach MySQL is
+        not healthy in any useful sense."""
+        try:
+            db.session.execute(db.text("SELECT 1"))
+            from storage import health as storage_health
+            store = storage_health()
+            if not store.get("ok"):
+                return jsonify({"status": "degraded", "database": "connected",
+                                "storage": store}), 503
+            return jsonify({"status": "ok", "database": "connected",
+                            "storage": store}), 200
+        except Exception as exc:
+            app.logger.error("Health check failed: %s", exc, exc_info=True)
+            return jsonify({"status": "degraded", "database": "unreachable"}), 503
+
+    @app.before_request
+    def canonical_host():
+        """Redirects the alternate domains to the primary one.
+
+        dealbriz.com and dealbriz.in are separate registrable domains, so a
+        session cookie set on one is simply not sent to the other — a user
+        who signs in on .com and later opens .in would appear logged out
+        with no explanation. Enforced here as well as in nginx because API
+        calls can reach the app directly through the load balancer without
+        passing the frontend container.
+        """
+        primary = os.environ.get("PRIMARY_DOMAIN", "").strip().lower()
+        if not primary or request.method not in ("GET", "HEAD"):
+            return None
+        host = (request.host or "").split(":")[0].lower()
+        if not host or host == primary or host in ("localhost", "127.0.0.1"):
+            return None
+        # Only redirect hosts we actually own, so an unexpected Host header
+        # can't be used to bounce users somewhere arbitrary.
+        known = {"dealbriz.com", "www.dealbriz.com", "dealbriz.in", "www.dealbriz.in"}
+        extra = os.environ.get("ALT_DOMAINS", "")
+        known |= {d.strip().lower() for d in extra.split(",") if d.strip()}
+        if host not in known:
+            return None
+        return redirect(f"https://{primary}{request.full_path.rstrip('?')}", code=301)
+
+    register_error_handlers(app)
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, port=5000)

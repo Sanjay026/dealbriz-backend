@@ -1,0 +1,38 @@
+Tables to add
+
+1.User_session
+2.Financers
+3.Admin
+4.Roles admin, manager, superadmin, merchant 
+5.Puchase  purchase_id, product_id
+6.Purchase_user purchase_user_id, purchase_id, user_id
+
+
+Admin panel 
+1.Login based in roles
+2.user Tables  add, edit, delete, view
+3.Product Tables
+4.Purchase Table
+5.Purchase data Table
+6.Financers Table
+
+
+python seed_data.py            # create test data
+python seed_data.py --clear    # remove it all
+python seed_data.py --reset    # clear, then rebuild
+
+docker compose exec backend python seed_data.py            create test data
+docker compose exec backend python seed_data.py --clear    remove all test data
+docker compose exec backend python seed_data.py --reset    clear, then recreate
+
+--------Commands to run on Docker--------
+
+docker compose exec -T db mysql -uroot -p195012 dealbridge < ddb\query12.sql
+
+docker compose up -d --build
+
+docker compose start
+
+docker compose ps
+
+docker compose stop

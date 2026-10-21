@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Never bake secrets into an image — .env is mounted or passed at run time.
+.env
+*.env
+!.env.example
+
+logs/
+uploads/
+*.log
+
+.git/
+.gitignore
+.pytest_cache/
+.DS_Store

@@ -1,0 +1,105 @@
+from datetime import datetime
+
+from extensions import db
+from .base import gen_id, iso_utc
+
+
+SHOW_PHONE_YES = "yes"
+SHOW_PHONE_NO = "chat_only"
+
+
+def normalize_show_phone(value):
+    """One spelling for the per-listing phone setting.
+
+    The website stores "yes" / "chat_only"; the app used to send a boolean,
+    which MySQL kept as "1" / "0". Anything that isn't a clear yes is treated
+    as hidden, so an unknown value can never leak a number.
+    """
+    if value is True:
+        return SHOW_PHONE_YES
+    if isinstance(value, str) and value.strip().lower() in ("yes", "1", "true", "show"):
+        return SHOW_PHONE_YES
+    return SHOW_PHONE_NO
+
+
+class Product(db.Model):
+    __tablename__ = "products"
+    id = db.Column(db.String(36), primary_key=True, default=gen_id)
+    title = db.Column(db.String(200), nullable=False)
+    category = db.Column(db.String(30), nullable=False)
+    condition = db.Column("condition", db.String(20), nullable=False)
+    price = db.Column(db.Numeric(12, 2), nullable=False)
+    original_price = db.Column(db.Numeric(12, 2))
+    negotiable = db.Column(db.Boolean, default=False)
+    emi_eligible = db.Column(db.Boolean, default=True)
+    description = db.Column(db.Text)
+    image_url = db.Column(db.Text)
+    extra_images = db.Column(db.Text)  # comma-separated URLs
+    posted_by = db.Column(db.String(36), db.ForeignKey("users.id", ondelete="SET NULL"))
+    seller_name = db.Column(db.String(200))
+    seller_avatar = db.Column(db.Text)
+    seller_phone = db.Column(db.String(20))
+    show_phone = db.Column(db.String(20), default="chat_only")
+    location = db.Column(db.String(200))
+    city = db.Column(db.String(10), nullable=False)
+    landmark = db.Column(db.String(200))
+    brand = db.Column(db.String(100))
+    model = db.Column(db.String(100))
+    # Category fields (year, km_driven, fuel, owners, storage, bedrooms...)
+    # stored ON the product row. They used to live only in the
+    # product_attributes table, which meant a relationship and a join had to
+    # work for them to appear — and when that silently returned nothing, the
+    # listing showed blank fields with no error. Here they cannot arrive
+    # without the product. product_attributes still exists, rebuilt from this
+    # on every save, purely as the indexed search index.
+    attributes_json = db.Column(db.JSON)
+    views = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(20), default="active")
+    # "Show at top" promotion. An expiry timestamp rather than a boolean, so a
+    # promotion lapses by itself — no cleanup job, and no listing stays pinned
+    # forever because someone forgot to unset a flag.
+    featured_until = db.Column(db.DateTime)
+    featured_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    @property
+    def is_featured(self):
+        return bool(self.featured_until and self.featured_until > datetime.utcnow())
+
+    def phone_is_public(self):
+        return normalize_show_phone(self.show_phone) == SHOW_PHONE_YES
+
+    def to_dict(self):
+        return {
+            "id": self.id, "title": self.title, "category": self.category,
+            "condition": self.condition, "price": float(self.price),
+            "original_price": float(self.original_price) if self.original_price else None,
+            "negotiable": self.negotiable, "emi_eligible": self.emi_eligible,
+            "description": self.description, "image_url": self.image_url,
+            "extra_images": self.extra_images.split(",") if self.extra_images else [],
+            "posted_by": self.posted_by, "seller_name": self.seller_name,
+            "seller_avatar": self.seller_avatar,
+            # The number is only ever sent when the seller chose to show it.
+            # Hiding it in the app alone isn't enough: anything in this JSON
+            # is readable by whoever calls the API.
+            "seller_phone": self.seller_phone if self.phone_is_public() else None,
+            "show_phone": normalize_show_phone(self.show_phone), "location": self.location,
+            "city": self.city, "landmark": self.landmark,
+            "brand": self.brand, "model": self.model, "views": self.views,
+            "status": self.status,
+            "is_featured": self.is_featured,
+            "featured_until": iso_utc(self.featured_until),
+            "created_at": iso_utc(self.created_at),
+            # Straight off the row — no join, no relationship, nothing that
+            # can come back empty while the product itself loads fine.
+            "attributes": self.attributes_json or {},
+        }
+
+
+class SavedProduct(db.Model):
+    __tablename__ = "saved_products"
+    id = db.Column(db.String(36), primary_key=True, default=gen_id)
+    user_id = db.Column(db.String(36), db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    product_id = db.Column(db.String(36), db.ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    saved_at = db.Column(db.DateTime, default=datetime.utcnow)
+    __table_args__ = (db.UniqueConstraint("user_id", "product_id"),)

@@ -1,0 +1,1033 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required
+
+from extensions import db
+from datetime import datetime
+from sqlalchemy import func
+
+from models import (User, Product, EmiApplication, Role, Admin, Financer,
+                    FinancerMember, Purchase, PurchaseUser, Report, Notification)
+from permissions import (allowed_sections, has_capability, require_capability,
+                         user_capabilities)
+from utils import current_user, get_user_role_names, has_staff_access, is_superadmin
+from emi.status import (EMI_ACTIVE_STATUSES, EMI_DECISION_STATUSES,  # noqa: F401
+                        EMI_NOTIFICATION_TITLES, EMI_STATUSES,
+                        EMI_TERMINAL_STATUSES, set_emi_status)
+
+bp = Blueprint("admin", __name__, url_prefix="/api/admin")
+
+# Fields an admin/staff member may edit on ANY product (not just their own).
+ADMIN_EDITABLE_FIELDS = [
+    "title", "category", "condition", "price", "original_price",
+    "negotiable", "emi_eligible", "description", "image_url", "extra_images",
+    "show_phone", "location", "city", "landmark", "brand", "model", "status"
+]
+
+
+# ===================== VERIFY =====================
+
+@bp.route("/verify", methods=["GET"])
+@jwt_required()
+def admin_verify():
+    """Confirms staff access and reports exactly what this user may do, so
+    the admin panel renders only the sections they can actually use."""
+    user = current_user()
+    if not has_staff_access(user):
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify({
+        "ok": True,
+        "roles": get_user_role_names(user.id),
+        "is_superadmin": is_superadmin(user),
+        "capabilities": sorted(user_capabilities(user)),
+        "sections": allowed_sections(user),
+    })
+
+
+# ===================== USERS CRUD =====================
+
+def _lender_info(user_id, members=None, financers=None):
+    """{financer_id, name} for a user linked to a lender, else None."""
+    m = members.get(user_id) if members is not None else FinancerMember.query.get(user_id)
+    if not m:
+        return None
+    f = financers.get(m.financer_id) if financers is not None else Financer.query.get(m.financer_id)
+    return {"financer_id": m.financer_id, "name": f.name if f else None}
+
+
+@bp.route("/users", methods=["GET"])
+@require_capability("users.view")
+def admin_list_users():
+    users = User.query.order_by(User.created_at.desc()).all()
+    members = {m.user_id: m for m in FinancerMember.query.all()}
+    financers = {f.financer_id: f for f in Financer.query.all()}
+    result = []
+    for u in users:
+        d = u.to_dict()
+        d["roles"] = get_user_role_names(u.id)
+        d["lender"] = _lender_info(u.id, members, financers)
+        result.append(d)
+    return jsonify(result)
+
+
+@bp.route("/users/<uid>", methods=["GET"])
+@require_capability("users.view")
+def admin_get_user(uid):
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    d["lender"] = _lender_info(u.id)
+    return jsonify(d)
+
+
+@bp.route("/users/<uid>", methods=["PUT"])
+@require_capability("users.view")
+def admin_update_user(uid):
+    caller = current_user()
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json()
+
+    for field in ["first_name", "last_name", "phone", "city"]:
+        if field in data:
+            setattr(u, field, data[field])
+
+    # Only superadmins can grant/revoke staff roles. A user holds at most
+    # one active staff role at a time — assigning a new one deactivates
+    # whatever they had before instead of stacking on top of it.
+    if "role_name" in data:
+        if not is_superadmin(caller):
+            return jsonify({"error": "Only superadmins can change roles"}), 403
+        new_role_name = data["role_name"]
+        role = Role.query.filter_by(role_name=new_role_name).first()
+        if not role:
+            return jsonify({"error": "Invalid role name"}), 400
+
+        # The lender role always belongs to one lender: that is what keeps
+        # each lender's people to their own loans. Any other role drops the
+        # link.
+        if new_role_name == "lender":
+            financer = Financer.query.get(data.get("financer_id")) if data.get("financer_id") else None
+            if not financer:
+                return jsonify({"error": "Choose which lender (NBFC) this user works for."}), 400
+            if u.id == caller.id:
+                return jsonify({"error": "You can't make yourself a lender user."}), 400
+            member = FinancerMember.query.get(u.id)
+            if member:
+                member.financer_id = financer.financer_id
+                member.added_by = caller.id
+            else:
+                db.session.add(FinancerMember(user_id=u.id, financer_id=financer.financer_id,
+                                              added_by=caller.id))
+        else:
+            FinancerMember.query.filter_by(user_id=u.id).delete()
+
+        Admin.query.filter_by(user_id=u.id, is_active=True).update({"is_active": False})
+
+        existing = Admin.query.filter_by(user_id=u.id, role_id=role.role_id).first()
+        if existing:
+            existing.is_active = True
+            existing.assigned_by = caller.id
+        else:
+            db.session.add(Admin(user_id=u.id, role_id=role.role_id, assigned_by=caller.id))
+
+        u.is_admin = new_role_name in ("admin", "manager", "superadmin")
+
+    db.session.commit()
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    d["lender"] = _lender_info(u.id)
+    return jsonify(d)
+
+
+@bp.route("/users/<uid>/role", methods=["DELETE"])
+@require_capability("users.assign_role")
+def admin_remove_user_role(uid):
+    caller = current_user()
+    """Removes (deactivates) whatever staff role the user currently has.
+    Superadmin-only, and a superadmin can't strip their own role — same
+    self-protection pattern as the account-delete endpoint below, so
+    nobody can accidentally lock every superadmin out."""
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    if u.id == caller.id:
+        return jsonify({"error": "Cannot remove your own role"}), 400
+
+    Admin.query.filter_by(user_id=u.id, is_active=True).update({"is_active": False})
+    FinancerMember.query.filter_by(user_id=u.id).delete()
+    u.is_admin = False
+    db.session.commit()
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    return jsonify(d)
+
+
+@bp.route("/users/<uid>", methods=["DELETE"])
+@require_capability("users.delete")
+def admin_delete_user(uid):
+    caller = current_user()
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    if u.id == caller.id:
+        return jsonify({"error": "Cannot delete your own account"}), 400
+
+    # DealLock offers and deals are the record of what a buyer and seller
+    # agreed, so the database keeps them (their foreign keys are RESTRICT)
+    # and a delete would fail. Suspending keeps the evidence and blocks the
+    # account, which is what this is usually for anyway.
+    from deals.service import deal_records_exist_for_user
+    if deal_records_exist_for_user(u.id):
+        return jsonify({"error": "This user has DealLock offers or deals on record, "
+                                 "so the account can't be deleted. Suspend it instead."}), 409
+
+    # products.posted_by is ON DELETE SET NULL, so deleting the account alone
+    # would leave this seller's listings live on the site — still showing the
+    # name and phone stored on each row. For removing a fraudulent seller that
+    # is exactly the wrong outcome, so take their listings down first.
+    removed = Product.query.filter_by(posted_by=u.id).update({"status": "removed"})
+
+    db.session.delete(u)
+    db.session.commit()
+    return jsonify({"ok": True, "listings_removed": removed})
+
+
+@bp.route("/users/<uid>/suspend", methods=["POST"])
+@require_capability("users.suspend")
+def suspend_user(uid):
+    caller = current_user()
+    """Suspend or reinstate an account. Suspension blocks login and hides the
+    user's listings while keeping the account, its listings, and any reports
+    intact — the right first response to a report, since deleting the account
+    destroys the evidence you may later need."""
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    if u.id == caller.id:
+        return jsonify({"error": "Cannot suspend your own account"}), 400
+
+    data = request.get_json() or {}
+    suspend = bool(data.get("suspended", True))
+
+    outbox = None
+    if suspend:
+        # Release this user's DealLock deals that haven't paid out yet and
+        # withdraw their open offers, before their listings are hidden below.
+        # No strike: being suspended isn't the seller backing out.
+        from deals.service import Outbox, release_live_deals_for_user
+        from models.deal import RELEASE_ACCOUNT_SUSPENDED
+        outbox = Outbox()
+        release_live_deals_for_user(u.id, RELEASE_ACCOUNT_SUSPENDED, outbox, actor_id=caller.id)
+        u.account_status = "suspended"
+        u.suspended_at = datetime.utcnow()
+        u.suspension_reason = (data.get("reason") or "").strip()[:255] or None
+        # Hide their listings from the marketplace, but keep them as 'removed'
+        # rather than deleting, so everything is restorable on reinstatement.
+        affected = Product.query.filter_by(posted_by=u.id, status="active").update({"status": "removed"})
+    else:
+        u.account_status = "active"
+        u.suspended_at = None
+        u.suspension_reason = None
+        affected = Product.query.filter_by(posted_by=u.id, status="removed").update({"status": "active"})
+
+    db.session.commit()
+    if outbox:
+        outbox.send()
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    d["listings_affected"] = affected
+    return jsonify(d)
+
+
+# ===================== PRODUCTS: full visibility + edit + hard delete =====================
+
+@bp.route("/users/<uid>/deal-ban", methods=["DELETE"])
+@require_capability("users.suspend")
+def lift_deal_ban(uid):
+    """Ends a DealLock ban early (3 cancelled deals in a row) and sets the
+    count back to 0, e.g. when the cancels weren't the user's fault."""
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    u.deal_ban_until = None
+    u.consecutive_cancels = 0
+    Notification.push(u.id, "system", "You can post listings and make deals again",
+                      body="DealBriz support lifted the pause on your account.")
+    db.session.commit()
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    d["lender"] = _lender_info(u.id)
+    return jsonify(d)
+
+
+@bp.route("/products", methods=["GET"])
+@require_capability("products.view")
+def admin_list_products():
+    """All listings, with optional filters so staff can find a specific one
+    without scrolling. Unlike the public buy endpoint this is not restricted
+    to active listings — moderation needs to see sold and removed ones too."""
+
+    q = Product.query
+
+    category = request.args.get("category")
+    status = request.args.get("status")
+    search = (request.args.get("search") or "").strip()
+    seller = (request.args.get("seller") or "").strip()
+    emi_only = request.args.get("emi_only")
+    min_price = request.args.get("min_price", type=float)
+    max_price = request.args.get("max_price", type=float)
+
+    if category and category != "all":
+        q = q.filter_by(category=category)
+    if status and status != "all":
+        q = q.filter_by(status=status)
+    if search:
+        like = f"%{search}%"
+        # Match the listing id too, so an id pasted from a report or an EMI
+        # application finds its listing directly.
+        q = q.filter(db.or_(
+            Product.title.like(like),
+            Product.brand.like(like),
+            Product.model.like(like),
+            Product.id.like(like),
+        ))
+    if seller:
+        like = f"%{seller}%"
+        q = q.filter(db.or_(Product.seller_name.like(like), Product.posted_by.like(like)))
+    if emi_only == "true":
+        q = q.filter_by(emi_eligible=True)
+    if min_price is not None:
+        q = q.filter(Product.price >= min_price)
+    if max_price is not None:
+        q = q.filter(Product.price <= max_price)
+
+    sort = request.args.get("sort", "newest")
+    if sort == "price_asc":
+        q = q.order_by(Product.price.asc())
+    elif sort == "price_desc":
+        q = q.order_by(Product.price.desc())
+    elif sort == "views":
+        q = q.order_by(Product.views.desc())
+    else:
+        q = q.order_by(Product.created_at.desc())
+
+    products = q.all()
+    return jsonify([p.to_dict() for p in products])
+
+
+@bp.route("/products/<pid>", methods=["GET"])
+@require_capability("products.view")
+def admin_get_product(pid):
+    """Single-listing view for staff. Unlike the public GET /api/buy/<id>,
+    this returns moderation context the public endpoint has no business
+    exposing: the seller's real account details, and any EMI applications
+    and completed purchase tied to this listing."""
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+
+    d = p.to_dict()
+
+    seller = User.query.get(p.posted_by) if p.posted_by else None
+    d["seller"] = {
+        "id": seller.id,
+        "name": f"{seller.first_name} {seller.last_name}".strip(),
+        "email": seller.email,
+        "phone": seller.phone,
+        "city": seller.city,
+        "joined": seller.created_at.isoformat() if seller.created_at else None
+    } if seller else None
+
+    emi_apps = (
+        EmiApplication.query
+        .filter_by(product_id=p.id)
+        .order_by(EmiApplication.applied_at.desc())
+        .all()
+    )
+    d["emi_applications"] = [a.to_dict() for a in emi_apps]
+
+    purchase = Purchase.query.filter_by(product_id=p.id).order_by(Purchase.purchase_date.desc()).first()
+    if purchase:
+        pd = purchase.to_dict()
+        for part in PurchaseUser.query.filter_by(purchase_id=purchase.purchase_id).all():
+            u = User.query.get(part.user_id)
+            pd[f"{part.role_in_purchase}_name"] = f"{u.first_name} {u.last_name}".strip() if u else "Unknown"
+        d["purchase"] = pd
+    else:
+        d["purchase"] = None
+
+    return jsonify(d)
+
+
+@bp.route("/products/<pid>", methods=["PUT"])
+@require_capability("products.edit")
+def admin_update_product(pid):
+    """Lets staff edit ANY listing (any seller, any category) — the piece
+    that was missing before: admins could view and delete products, but
+    not correct or moderate them in place."""
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json() or {}
+
+    # DealLock: changing a reserved listing's status releases its deal (no
+    # strike for the seller), and nobody sets "reserved" by hand.
+    outbox = None
+    if "status" in data and data["status"] != p.status:
+        from deals.service import Outbox, guard_listing_status_change
+        outbox = Outbox()
+        problem = guard_listing_status_change(p, data["status"], current_user(), True, outbox)
+        if problem:
+            db.session.rollback()
+            return jsonify({"error": problem}), 409
+
+    for field in ADMIN_EDITABLE_FIELDS:
+        if field in data:
+            if field == "extra_images":
+                setattr(p, field, ",".join(data[field]) if data[field] else None)
+            else:
+                setattr(p, field, data[field])
+
+    # Category attributes (year, km, fuel, owners...) were NOT saved here,
+    # only on the seller's own edit route. Staff edit uses this endpoint, so
+    # anything typed into those fields was silently discarded on save — the
+    # form accepted it, the listing never showed it, and reopening the editor
+    # showed them empty again with no error anywhere.
+    #
+    # Only touched when the key is present: a partial update that does not
+    # mention attributes must not wipe the ones already stored.
+    if "attributes" in data:
+        from sell.routes import save_product_attributes
+        save_product_attributes(p, data.get("attributes") or {})
+
+    db.session.commit()
+    if outbox:
+        outbox.send()
+    return jsonify(p.to_dict())
+
+
+@bp.route("/products/<pid>", methods=["DELETE"])
+@require_capability("products.delete")
+def admin_delete_product(pid):
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    # Same reason as deleting a user: DealLock history is kept, so a listing
+    # with offers or deals can't be hard-deleted. "Remove from site" hides it.
+    from deals.service import deal_records_exist_for_product
+    if deal_records_exist_for_product(p.id):
+        return jsonify({"error": "This listing has DealLock offers or deals on record, "
+                                 "so it can't be deleted. Remove it from the site instead."}), 409
+    # Its documents' rows go with it (ON DELETE CASCADE); their private
+    # files are deleted here, after the commit.
+    from models import ListingDocument
+    keys = [d.storage_key for d in ListingDocument.query.filter_by(product_id=p.id).all() if d.storage_key]
+    ListingDocument.query.filter_by(product_id=p.id).delete()
+    db.session.delete(p)
+    db.session.commit()
+    if keys:
+        from deals import doc_storage
+        from deals.listing_docs import key_in_use_elsewhere
+        for k in keys:
+            if not key_in_use_elsewhere(k):
+                doc_storage.delete(k)
+    return jsonify({"ok": True})
+
+
+# ===================== PURCHASES =====================
+
+@bp.route("/purchases", methods=["GET"])
+@require_capability("purchases.view")
+def admin_list_purchases():
+    purchases = Purchase.query.order_by(Purchase.purchase_date.desc()).all()
+    result = []
+    for pur in purchases:
+        d = pur.to_dict()
+        product = Product.query.get(pur.product_id)
+        d["product_title"] = product.title if product else "Deleted listing"
+        d["product_image"] = product.image_url if product else None
+        participants = PurchaseUser.query.filter_by(purchase_id=pur.purchase_id).all()
+        for part in participants:
+            u = User.query.get(part.user_id)
+            key = f"{part.role_in_purchase}_name"
+            d[key] = f"{u.first_name} {u.last_name}".strip() if u else "Unknown"
+        result.append(d)
+    return jsonify(result)
+
+
+# ===================== FINANCERS CRUD =====================
+
+@bp.route("/financers", methods=["GET"])
+@require_capability("financers.view")
+def admin_list_financers():
+    financers = Financer.query.order_by(Financer.created_at.desc()).all()
+    return jsonify([f.to_dict() for f in financers])
+
+
+def _loan_types_value(raw):
+    """["vehicle", "personal"] or "vehicle,personal" -> ("vehicle,personal", None)."""
+    from models.deal import LOAN_TYPES
+    items = raw.split(",") if isinstance(raw, str) else (raw if isinstance(raw, list) else None)
+    if items is None:
+        return None, "loan_types must be a list."
+    chosen = [t for t in LOAN_TYPES if t in {str(x).strip().lower() for x in items}]
+    unknown = {str(x).strip().lower() for x in items if str(x).strip()} - set(LOAN_TYPES)
+    if unknown:
+        return None, f"Unknown loan type: {', '.join(sorted(unknown))}"
+    return ",".join(chosen), None
+
+
+@bp.route("/financers", methods=["POST"])
+@require_capability("financers.manage")
+def admin_create_financer():
+    data = request.get_json()
+    required = ["name", "min_interest_rate", "max_interest_rate", "max_loan_amount"]
+    if not all(data.get(f) is not None for f in required):
+        return jsonify({"error": "Missing required fields"}), 400
+    loan_types, problem = _loan_types_value(data.get("loan_types", ["vehicle", "personal"]))
+    if problem:
+        return jsonify({"error": problem}), 400
+    f = Financer(
+        name=data["name"], contact_email=data.get("contact_email"), contact_phone=data.get("contact_phone"),
+        loan_types=loan_types,
+        min_interest_rate=data["min_interest_rate"], max_interest_rate=data["max_interest_rate"],
+        min_loan_amount=data.get("min_loan_amount", 5000), max_loan_amount=data["max_loan_amount"],
+        status=data.get("status", "active"),
+        address_line=data.get("address_line"), city=data.get("city"),
+        state=data.get("state"), pincode=data.get("pincode"),
+        serves_all_india=bool(data.get("serves_all_india", True))
+    )
+    db.session.add(f)
+    db.session.commit()
+    return jsonify(f.to_dict()), 201
+
+
+@bp.route("/financers/<int:fid>", methods=["PUT"])
+@require_capability("financers.manage")
+def admin_update_financer(fid):
+    f = Financer.query.get(fid)
+    if not f:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json()
+    for field in ["name", "contact_email", "contact_phone", "min_interest_rate",
+                  "max_interest_rate", "min_loan_amount", "max_loan_amount", "status",
+                  "address_line", "city", "state", "pincode", "serves_all_india"]:
+        if field in data:
+            setattr(f, field, data[field])
+    if "loan_types" in data:
+        loan_types, problem = _loan_types_value(data["loan_types"])
+        if problem:
+            return jsonify({"error": problem}), 400
+        f.loan_types = loan_types
+    db.session.commit()
+    return jsonify(f.to_dict())
+
+
+@bp.route("/financers/<int:fid>", methods=["DELETE"])
+@require_capability("financers.manage")
+def admin_delete_financer(fid):
+    f = Financer.query.get(fid)
+    if not f:
+        return jsonify({"error": "Not found"}), 404
+    db.session.delete(f)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+# ===================== EMI REVIEW =====================
+
+@bp.route("/emi", methods=["GET"])
+@require_capability("emi.view")
+def all_emi():
+    user = current_user()
+    """Staff list of EMI applications. Archived ones are excluded by default;
+    pass ?include_archived=true to see them."""
+
+    q = EmiApplication.query
+    if request.args.get("include_archived") != "true":
+        q = q.filter(EmiApplication.is_archived == False)
+
+    apps = q.order_by(EmiApplication.applied_at.desc()).all()
+    result = []
+    for a in apps:
+        d = a.to_dict()
+        applicant = User.query.get(a.user_id)
+        d["applicant_email"] = applicant.email if applicant else None
+        # Tell the frontend whether a hard delete is even possible, so it can
+        # avoid offering an action that would be refused.
+        d["has_purchase"] = Purchase.query.filter_by(emi_application_id=a.id).first() is not None
+        if a.reviewed_by:
+            reviewer = User.query.get(a.reviewed_by)
+            d["reviewed_by_name"] = f"{reviewer.first_name} {reviewer.last_name}".strip() if reviewer else None
+        else:
+            d["reviewed_by_name"] = None
+        result.append(d)
+    return jsonify(result)
+
+
+@bp.route("/emi/<eid>", methods=["PUT"])
+@require_capability("emi.review")
+def update_emi_status(eid):
+    user = current_user()
+    emi = EmiApplication.query.get(eid)
+    if not emi:
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.get_json() or {}
+    if "status" in data:
+        new_status = data["status"]
+        if new_status not in EMI_STATUSES:
+            return jsonify({"error": f"Invalid status '{new_status}'"}), 400
+
+        old_status = set_emi_status(emi, new_status, user)
+    else:
+        old_status = new_status = emi.status
+
+    if "decision_notes" in data:
+        emi.decision_notes = (data.get("decision_notes") or "").strip()[:2000] or None
+
+    # DealLock: the lender's reference number and Key Fact Statement link,
+    # typed in by staff from what the lender sends.
+    if "nbfc_application_reference" in data:
+        emi.nbfc_application_reference = (str(data.get("nbfc_application_reference") or "")
+                                          .strip()[:150] or None)
+    if "kfs_url" in data:
+        url = str(data.get("kfs_url") or "").strip()
+        if url and not url.startswith("https://"):
+            return jsonify({"error": "The KFS link must start with https://"}), 400
+        emi.kfs_url = url[:500] or None
+    if "is_archived" in data:
+        emi.is_archived = bool(data["is_archived"])
+    if "financer_id" in data:
+        fid = data["financer_id"]
+        if fid in (None, "", 0):
+            emi.financer_id = None
+        else:
+            financer = Financer.query.get(fid)
+            if not financer:
+                return jsonify({"error": "Unknown financer"}), 400
+            if emi.deal_id:
+                from models import Deal
+                linked_deal = Deal.query.get(emi.deal_id)
+                if linked_deal and linked_deal.loan_type not in financer.loan_type_list():
+                    return jsonify({"error": f"{financer.name} doesn't fund "
+                                             f"{linked_deal.loan_type} loans."}), 400
+            emi.financer_id = financer.financer_id
+
+    # DealLock: a loan linked to a deal moves the deal with it (approved,
+    # rejected...) and keeps the deal's lender in step until the payout.
+    outbox = None
+    if emi.deal_id:
+        from deals.service import Outbox, apply_loan_status_to_deal
+        from models import Deal
+        outbox = Outbox()
+        problem = apply_loan_status_to_deal(emi, old_status, new_status, user, outbox)
+        if problem:
+            db.session.rollback()
+            return jsonify({"error": problem}), 409
+        deal = Deal.query.get(emi.deal_id)
+        if deal and deal.status in ("locked", "loan_in_progress", "ready_to_pay") \
+                and emi.financer_id and deal.financer_id != emi.financer_id:
+            deal.financer_id = emi.financer_id
+
+    db.session.commit()
+    if outbox:
+        outbox.send()
+    return jsonify(emi.to_dict())
+
+
+@bp.route("/emi/<eid>/archive", methods=["POST"])
+@require_capability("emi.review")
+def archive_emi(eid):
+    user = current_user()
+    """Archive or unarchive an application. Only applications in a finished
+    state can be archived — archiving one still under review or mid-repayment
+    would hide work that still needs doing."""
+    emi = EmiApplication.query.get(eid)
+    if not emi:
+        return jsonify({"error": "Not found"}), 404
+
+    archive = bool((request.get_json() or {}).get("archived", True))
+    if archive and emi.status not in EMI_TERMINAL_STATUSES:
+        return jsonify({
+            "error": "Only finished applications can be archived. "
+                     "Set the status to completed, cancelled, or rejected first."
+        }), 400
+
+    emi.is_archived = archive
+    db.session.commit()
+    return jsonify(emi.to_dict())
+
+
+@bp.route("/emi/<eid>", methods=["DELETE"])
+@require_capability("emi.delete")
+def delete_emi(eid):
+    """Permanently delete an application. Superadmin-only, and refused if a
+    purchase references it: purchase.emi_application_id is ON DELETE SET NULL,
+    so deleting would silently strip the agreed loan terms from a completed
+    sale and leave it marked as an EMI purchase with no terms attached.
+    Archive those instead."""
+    emi = EmiApplication.query.get(eid)
+    if not emi:
+        return jsonify({"error": "Not found"}), 404
+
+    if Purchase.query.filter_by(emi_application_id=emi.id).first():
+        return jsonify({
+            "error": "This application is linked to a completed purchase and "
+                     "cannot be deleted. Archive it instead to keep the loan record."
+        }), 409
+    # DealLock: the loan record of a deal is kept for the same reason.
+    if emi.deal_id:
+        return jsonify({
+            "error": "This application is the loan for a DealLock deal and cannot be "
+                     "deleted. Archive it instead once it is finished."
+        }), 409
+
+    db.session.delete(emi)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/emi/<eid>", methods=["GET"])
+@require_capability("emi.view")
+def admin_get_emi(eid):
+    """Full detail for one application: the money, the applicant, the audit
+    timeline, and the linked listing/purchase."""
+    a = EmiApplication.query.get(eid)
+    if not a:
+        return jsonify({"error": "Not found"}), 404
+
+    d = a.to_dict()
+    applicant = User.query.get(a.user_id)
+    d["applicant"] = {
+        "id": applicant.id,
+        "name": f"{applicant.first_name} {applicant.last_name}".strip(),
+        "email": applicant.email,
+        "phone": applicant.phone,
+        "city": applicant.city,
+        "account_status": applicant.account_status or "active",
+        "joined": applicant.created_at.isoformat() if applicant.created_at else None,
+    } if applicant else None
+
+    reviewer = User.query.get(a.reviewed_by) if a.reviewed_by else None
+    d["reviewed_by_name"] = f"{reviewer.first_name} {reviewer.last_name}".strip() if reviewer else None
+
+    financer = Financer.query.get(a.financer_id) if a.financer_id else None
+    d["financer_name"] = financer.name if financer else None
+
+    product = Product.query.get(a.product_id) if a.product_id else None
+    d["product"] = {
+        "id": product.id, "title": product.title, "status": product.status,
+        "price": float(product.price), "seller_name": product.seller_name,
+        "posted_by": product.posted_by,
+    } if product else None
+
+    purchase = Purchase.query.filter_by(emi_application_id=a.id).first()
+    d["purchase"] = purchase.to_dict() if purchase else None
+    d["has_purchase"] = purchase is not None
+    return jsonify(d)
+
+
+# ===================== SELLER REPORTS =====================
+
+REPORT_STATUSES = {"open", "investigating", "action_taken", "dismissed"}
+
+
+@bp.route("/reports", methods=["GET"])
+@require_capability("reports.view")
+def admin_list_reports():
+    """Report queue for staff. Open reports first, then newest."""
+
+    q = Report.query
+    status = request.args.get("status")
+    if status and status != "all":
+        q = q.filter_by(status=status)
+    rtype = request.args.get("type")
+    if rtype and rtype != "all":
+        q = q.filter_by(report_type=rtype)
+
+    reports = q.order_by(Report.created_at.desc()).all()
+    result = []
+    for r in reports:
+        d = r.to_dict()
+        seller = User.query.get(r.reported_user_id)
+        reporter = User.query.get(r.reporter_id) if r.reporter_id else None
+        product = Product.query.get(r.product_id) if r.product_id else None
+        reviewer = User.query.get(r.reviewed_by) if r.reviewed_by else None
+
+        d["reported_user"] = {
+            "id": seller.id,
+            "name": f"{seller.first_name} {seller.last_name}".strip(),
+            "email": seller.email,
+            "phone": seller.phone,
+            "account_status": seller.account_status or "active",
+        } if seller else None
+        if reporter:
+            d["reporter_name"] = f"{reporter.first_name} {reporter.last_name}".strip()
+        elif r.report_type == "problem":
+            # Problem reports accept logged-out submissions, so "no reporter"
+            # here means anonymous, NOT that the account was deleted.
+            d["reporter_name"] = "Not signed in"
+        else:
+            # Deleted reporters show as "Deleted user" — the report survives them.
+            d["reporter_name"] = "Deleted user"
+        d["product_title"] = product.title if product else None
+        d["reviewed_by_name"] = f"{reviewer.first_name} {reviewer.last_name}".strip() if reviewer else None
+        # How many total reports this seller has — one complaint is noise,
+        # a pattern is signal. Guarded: a problem report has no seller, and
+        # filter_by(reported_user_id=None) would otherwise count every
+        # problem report ever filed and show it as a damning seller history.
+        d["reports_against_seller"] = (
+            Report.query.filter_by(reported_user_id=r.reported_user_id).count()
+            if r.reported_user_id else 0
+        )
+        result.append(d)
+    return jsonify(result)
+
+
+@bp.route("/reports/<rid>", methods=["PUT"])
+@require_capability("reports.resolve")
+def admin_update_report(rid):
+    """Move a report through the queue. Reports aren't deleted — they're
+    resolved, so the history against a seller stays visible."""
+    caller = current_user()
+    r = Report.query.get(rid)
+    if not r:
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.get_json() or {}
+    if "status" in data:
+        if data["status"] not in REPORT_STATUSES:
+            return jsonify({"error": f"Invalid status '{data['status']}'"}), 400
+        r.status = data["status"]
+        r.reviewed_by = caller.id
+        r.reviewed_at = datetime.utcnow()
+    if "resolution_notes" in data:
+        r.resolution_notes = (data.get("resolution_notes") or "").strip()[:2000] or None
+
+    db.session.commit()
+    return jsonify(r.to_dict())
+
+
+# ===================== DASHBOARD ANALYTICS =====================
+
+@bp.route("/analytics", methods=["GET"])
+@require_capability("dashboard.view")
+def admin_analytics():
+    """Aggregate data for the admin dashboard charts. Four datasets in one
+    call since each is a small aggregate query — cheaper than four round
+    trips for what's ultimately a handful of rows each."""
+
+    # ---- EMI applications by place ----
+    # Product.city actually stores a pincode (naming predates this being
+    # clarified). Grouping on its first 3 digits gives the sorting
+    # district — the same granularity the buy page's "near" ranking and
+    # the home page map already use, so a chart here reads consistently
+    # with the rest of the app rather than introducing a second notion of
+    # "place". Applications whose listing has since been removed (product_id
+    # SET NULL) are bucketed separately rather than silently dropped.
+    prefix_expr = func.left(Product.city, 3)
+    place_rows = (
+        db.session.query(
+            prefix_expr.label("prefix"),
+            func.count(EmiApplication.id).label("count"),
+            func.sum(EmiApplication.loan_amount).label("total_loan"),
+        )
+        .outerjoin(Product, EmiApplication.product_id == Product.id)
+        .group_by(prefix_expr)
+        .all()
+    )
+    emi_by_place = [
+        {"prefix": r.prefix, "count": r.count, "total_loan": float(r.total_loan or 0)}
+        for r in place_rows
+    ]
+
+    # ---- EMI applications by financer ----
+    # financer_id is set by staff during review (see update_emi_status), not
+    # by the applicant, so a large "Unassigned" bucket is expected and
+    # informative on its own — it shows how much review work hasn't been
+    # attributed to a partner yet.
+    financer_rows = (
+        db.session.query(
+            EmiApplication.financer_id,
+            Financer.name,
+            func.count(EmiApplication.id).label("count"),
+            func.sum(EmiApplication.loan_amount).label("total_loan"),
+        )
+        .outerjoin(Financer, EmiApplication.financer_id == Financer.financer_id)
+        .group_by(EmiApplication.financer_id, Financer.name)
+        .all()
+    )
+    emi_by_financer = [
+        {"financer_id": r.financer_id, "name": r.name, "count": r.count, "total_loan": float(r.total_loan or 0)}
+        for r in financer_rows
+    ]
+
+    # ---- Sales by month (last 12 months, completed sales only) ----
+    month_expr = func.date_format(Purchase.purchase_date, "%Y-%m")
+    month_rows = (
+        db.session.query(
+            month_expr.label("month"),
+            func.count(Purchase.purchase_id).label("count"),
+            func.sum(Purchase.total_amount).label("total"),
+        )
+        .filter(Purchase.status == "completed")
+        .group_by(month_expr)
+        .order_by(month_expr)
+        .all()
+    )
+    sales_by_month = [
+        {"month": r.month, "count": r.count, "total": float(r.total or 0)}
+        for r in month_rows
+    ][-12:]
+
+    # ---- Top products by sales (completed sales only) ----
+    product_rows = (
+        db.session.query(
+            Purchase.product_id,
+            Product.title,
+            func.count(Purchase.purchase_id).label("count"),
+            func.sum(Purchase.total_amount).label("total"),
+        )
+        .join(Product, Purchase.product_id == Product.id)
+        .filter(Purchase.status == "completed")
+        .group_by(Purchase.product_id, Product.title)
+        .order_by(func.sum(Purchase.total_amount).desc())
+        .limit(8)
+        .all()
+    )
+    top_products = [
+        {"product_id": r.product_id, "title": r.title, "count": r.count, "total": float(r.total or 0)}
+        for r in product_rows
+    ]
+
+    # ---- Headline totals for the dashboard's overview cards ----
+    # Counted server-side with COUNT(*) rather than fetching each admin list
+    # and taking .length on the client: those lists are paginated/filtered
+    # views, so their length is not the true total, and pulling every row
+    # just to count it would get expensive as the marketplace grows.
+    totals = {
+        "users": db.session.query(func.count(User.id)).scalar() or 0,
+        "products": db.session.query(func.count(Product.id)).scalar() or 0,
+        "purchases": db.session.query(func.count(Purchase.purchase_id)).scalar() or 0,
+        "completed_sales_value": float(
+            db.session.query(func.coalesce(func.sum(Purchase.total_amount), 0))
+            .filter(Purchase.status == "completed").scalar() or 0
+        ),
+        "financers": db.session.query(func.count(Financer.financer_id)).scalar() or 0,
+        "open_reports": db.session.query(func.count(Report.report_id))
+            .filter(Report.status == "open").scalar() or 0,
+    }
+
+    return jsonify({
+        "totals": totals,
+        "emi_by_place": emi_by_place,
+        "emi_by_financer": emi_by_financer,
+        "sales_by_month": sales_by_month,
+        "top_products": top_products,
+    })
+
+
+# ===================== ROLE PERMISSIONS =====================
+
+@bp.route("/role-permissions", methods=["GET"])
+@jwt_required()
+def get_role_permissions():
+    """The full role × capability matrix, plus which sections each
+    capability unlocks so the UI can group them meaningfully.
+
+    Superadmin-only: this endpoint reveals the whole permission model, and
+    anyone who can read it is one step from wanting to change it.
+    """
+    from permissions import (CAPABILITIES, ROLE_CAPABILITIES, SECTION_CAPABILITY,
+                             effective_role_capabilities)
+    if not is_superadmin(current_user()):
+        return jsonify({"error": "Only superadmins can view role permissions"}), 403
+
+    from models import RolePermissionState
+    configured = {r.role_name for r in RolePermissionState.query.filter_by(configured=True).all()}
+
+    # Sections are what an admin actually thinks in, so send the mapping
+    # rather than making the UI hardcode it.
+    sections = [{"section": s, "capability": c} for s, c in SECTION_CAPABILITY.items()]
+
+    return jsonify({
+        "capabilities": sorted(CAPABILITIES),
+        "sections": sections,
+        "roles": [
+            {
+                "role": role,
+                "capabilities": sorted(effective_role_capabilities(role)),
+                "defaults": sorted(ROLE_CAPABILITIES.get(role, set())),
+                "is_customised": role in configured,
+                # superadmin is fixed on purpose — see effective_role_capabilities
+                "is_editable": role != "superadmin",
+            }
+            for role in ("superadmin", "admin", "manager", "dev", "lender", "merchant")
+        ],
+    })
+
+
+@bp.route("/role-permissions/<role>", methods=["PUT"])
+@jwt_required()
+def update_role_permissions(role):
+    from permissions import CAPABILITIES, clear_permission_cache
+    from models import RolePermission, RolePermissionState
+
+    caller = current_user()
+    if not is_superadmin(caller):
+        return jsonify({"error": "Only superadmins can change role permissions"}), 403
+    if role == "superadmin":
+        # Refused rather than silently ignored: a superadmin who removes
+        # users.assign_role from their own role can never grant it back,
+        # and the platform loses its administrator permanently.
+        return jsonify({"error": "Superadmin permissions can't be changed \u2014 "
+                                 "it would be possible to lock yourself out."}), 400
+    if role not in ("admin", "manager", "dev", "lender", "merchant"):
+        return jsonify({"error": "Unknown role"}), 400
+
+    data = request.get_json() or {}
+    requested = data.get("capabilities")
+    if not isinstance(requested, list):
+        return jsonify({"error": "capabilities must be a list"}), 400
+
+    unknown = [c for c in requested if c not in CAPABILITIES]
+    if unknown:
+        return jsonify({"error": f"Unknown capabilities: {', '.join(unknown[:5])}"}), 400
+
+    RolePermission.query.filter_by(role_name=role).delete()
+    for cap in set(requested):
+        db.session.add(RolePermission(role_name=role, capability=cap, updated_by=caller.id))
+
+    state = RolePermissionState.query.get(role)
+    if state:
+        state.configured = True
+    else:
+        db.session.add(RolePermissionState(role_name=role, configured=True))
+
+    db.session.commit()
+    clear_permission_cache()
+    return jsonify({"role": role, "capabilities": sorted(set(requested)), "is_customised": True})
+
+
+@bp.route("/role-permissions/<role>/reset", methods=["POST"])
+@jwt_required()
+def reset_role_permissions(role):
+    """Drops the override so the role returns to its built-in defaults."""
+    from permissions import clear_permission_cache, ROLE_CAPABILITIES
+    from models import RolePermission, RolePermissionState
+
+    if not is_superadmin(current_user()):
+        return jsonify({"error": "Only superadmins can change role permissions"}), 403
+    if role == "superadmin":
+        return jsonify({"error": "Superadmin permissions can't be changed"}), 400
+
+    RolePermission.query.filter_by(role_name=role).delete()
+    RolePermissionState.query.filter_by(role_name=role).delete()
+    db.session.commit()
+    clear_permission_cache()
+    return jsonify({"role": role, "capabilities": sorted(ROLE_CAPABILITIES.get(role, set())),
+                    "is_customised": False})

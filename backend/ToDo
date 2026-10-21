@@ -1,0 +1,92 @@
+API:
+BUy 
+CReate a buy folder in which all the buy related apis and models are there
+1.Get all the buy related list use pagination shohw only 30 items at once
+2.Add filter in the same api 
+3.use the same api for categories like cars, phones etc 
+Particular product api 
+---show the particular product when clicking on it /get api 
+chat with seller --different class async job user for the chat 
+call seller --- 
+
+Create Search api for search bar 
+
+SELL:
+new folder 
+add a post api 
+
+MY listings api 
+add a edit api /put api 
+show listing api /get api 
+
+Profile folder
+Get api for getting personal infor 
+edit api for editing personal info
+
+Saved items 
+gEt api for the saved items
+
+use same get api of buy based on the category for the categories showing on the main page 
+
+------- Use differnt folder for the admin panel section in the backend -----
+For all the categories use the /get api 
+for all the cateogries use the /edit api
+for all the categories use the /delete api 
+for all the categories use the /view 
+
+use the table format in the frontend for the admin panel 
+
+------------.--------------
+
+report seller option
+location access with map[show nearby sellers]
+-add button see ads in my location [show in map as well]
+
+user ad testing, listing testing by category at least 30
+
+implement chat with seller with ease and with some predefined messages
+
+-----------.------------
+Search more cities through pincode or name.
+show relevant results based on strings with or without space. eg.Smarttv or smart tv should give same results.
+back button from chat menu send user to home page .
+product sponsor option{to show user specific listing on top}.
+Filters option and search bar in admin panel all tables.
+EMI graphs on dashboard based on place , financers, sales by month, sales by products.
+admin panel: add terms and conditions.(and option to change those.) also fix the spacing etc and ui.
+use dynamic pagenation in tables so user can select each page , how many listing to show: min 10 and max 500.
+
+
+-------------------
+add pincodes from all over india, [focus mostly on Himachal Pradesh, that will be where its going be launched first.]
+Add a feature in admin paenl to hide all emi functionalities from the website. -----
+text formatting features in terms and conditions.
+Help centre page : FAQs 
+add FAQs, privacy policy in admin panel 
+create contact US and provacy policy page.
+make report problem page.
+
+Remove career, admin
+
+-------.--------
+create docker image and container ,WSGI implementaion
+error logging(backend and frontend)
+based on roles : show settings on admin panel (make according to you for now)
+add permission level settings to each user in admin panel that can only be changed by "superadmin"
+add security on api [jwt tokens]
+add all the pincodes based on cities, states in backend database and should be available in real time. show major cities already in search.
+make emi visibility based on location all over pincodes and state wise or district wise and search with pincode, city , state.
+also create a small chatbot based on FAQs, and particular user's profiles realted information, if not found, then redirect to contact us page
+add footer option from home page in all the new pages that were made from footer(contact us, report etc.)
+
+---------.------------
+search anything in the search area using human natural language
+e.g. hyundai car 2018 model under 5 lac and below 1 lac km run it should show the suggestions and result 
+e.g. iphone 12 grey color under 30000 
+kind of queries it can search 
+let me know how will you implement this using directly sql or do you need any llm model api and vector database to do so 
+we need to have higher accuracy so based on this we need to implemnt 
+
+add dev role in admin - add a role logs:which shows isuues realted to logs.
+specify different colors based on errors and normal state etc(red, green etc.)
+change name everywhere to DealBriz.

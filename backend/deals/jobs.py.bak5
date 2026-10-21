@@ -1,0 +1,100 @@
+"""
+DealLock timers. Run every 5 minutes from cron on the server:
+
+    docker compose -f docker-compose.prod.yml exec -T backend python -m deals.jobs
+
+What it does each run:
+  - open offers past their 48 hours -> expired
+  - deals not confirmed in time (the buyer didn't accept the warning within
+    24 hours, or the seller didn't confirm within 24 hours after that) ->
+    released, not counted against anyone, listing back on sale
+  - deals still before Ready to pay when the reservation ends (including
+    documents not approved in time) -> released, listing back on sale, both
+    sides told, loan application withdrawn
+  - loans with no update for 48 hours -> staff get a bell notification
+    (at most once a day per deal)
+  - cancel requests nobody answered within 24 hours -> lapse, the one who
+    asked is told (they can ask again and force-cancel)
+  - document files (buyer's and seller's) of deals closed more than 30 days
+    ago -> deleted
+
+It is safe to run twice at once or to miss a run: rows are claimed with
+SELECT ... FOR UPDATE SKIP LOCKED, and the routes already treat a lapsed
+offer as expired the moment it lapses, so a late run only delays the
+listing going back on sale.
+
+Not run inside Gunicorn on purpose: with several workers, an in-process
+scheduler would fire once per worker.
+"""
+import logging
+import sys
+
+
+def run():
+    from app import app
+    from extensions import db
+    from deals.service import (Outbox, expire_cancel_requests, expire_offers, flag_stalled_loans,
+                               purge_closed_deal_documents,
+                               release_expired_reservations, release_unconfirmed,
+                               utcnow)
+
+    log = logging.getLogger("dealbridge.deals.jobs")
+    with app.app_context():
+        now = utcnow()
+        expired = released = unconfirmed = stalled = purged = lapsed = 0
+        threads = []
+        try:
+            # Batches keep each transaction short. Loop until a batch comes
+            # back smaller than its limit.
+            while True:
+                n = expire_offers(now)
+                db.session.commit()
+                expired += n
+                if n < 200:
+                    break
+            while True:
+                outbox = Outbox()
+                n = release_unconfirmed(now, outbox)
+                db.session.commit()
+                threads += outbox.send()
+                unconfirmed += n
+                if n < 100:
+                    break
+            while True:
+                outbox = Outbox()
+                n = release_expired_reservations(now, outbox)
+                db.session.commit()
+                threads += outbox.send()
+                released += n
+                if n < 100:
+                    break
+            while True:
+                outbox = Outbox()
+                n = expire_cancel_requests(now, outbox)
+                db.session.commit()
+                threads += outbox.send()
+                lapsed += n
+                if n < 200:
+                    break
+            stalled = flag_stalled_loans(now)
+            db.session.commit()
+            purged = purge_closed_deal_documents(now)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            log.exception("DealLock timer run failed")
+            return 1
+        # Pushes go out on background threads; give them time to finish
+        # before this short-lived process exits.
+        for t in threads:
+            t.join(timeout=10)
+        msg = (f"DealLock timers: {expired} offer(s) expired, {unconfirmed} unconfirmed deal(s) "
+               f"released, {released} deal(s) released, {lapsed} cancel request(s) lapsed, "
+               f"{stalled} stalled loan(s) flagged, {purged} document file(s) deleted")
+        log.info(msg)
+        print(msg)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())
