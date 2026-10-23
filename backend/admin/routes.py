@@ -105,17 +105,24 @@ def admin_update_user(uid):
         if not role:
             return jsonify({"error": "Invalid role name"}), 400
 
-        # The lender role always belongs to one lender: that is what keeps
-        # each lender's people to their own loans. Any other role drops the
-        # link.
+        # A lender user works for one lender: that is what keeps each
+        # lender's people to their own loans. The superadmin either sets it
+        # here, or leaves it out (financer_id empty) and the user chooses it
+        # once in the Lender portal, after which it is locked; only this
+        # (a superadmin giving the lender role again) changes it. Any other
+        # role drops the link.
         if new_role_name == "lender":
-            financer = Financer.query.get(data.get("financer_id")) if data.get("financer_id") else None
-            if not financer:
-                return jsonify({"error": "Choose which lender (NBFC) this user works for."}), 400
             if u.id == caller.id:
                 return jsonify({"error": "You can't make yourself a lender user."}), 400
+            raw_fid = data.get("financer_id")
+            financer = Financer.query.get(raw_fid) if raw_fid not in (None, "", 0) else None
+            if raw_fid not in (None, "", 0) and not financer:
+                return jsonify({"error": "Unknown lender."}), 400
             member = FinancerMember.query.get(u.id)
-            if member:
+            if financer is None:
+                if member:
+                    db.session.delete(member)
+            elif member:
                 member.financer_id = financer.financer_id
                 member.added_by = caller.id
             else:

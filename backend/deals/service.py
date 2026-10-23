@@ -186,9 +186,10 @@ def lender_financer_id(user):
 
 def lender_may_check(fid, deal):
     """A lender's people may check a deal's documents when it is the deal's
-    lender, or, while no lender is set on the deal yet, when it funds that
-    kind of loan (so documents never wait for the loan application to pick
-    a lender)."""
+    lender (the one the buyer chose on the loan form), or, while the deal is
+    at the documents step and no lender is chosen yet, when it funds that
+    kind of loan (the buyer only chooses after the documents are verified
+    and the deal locks)."""
     if fid is None or deal is None:
         return False
     if deal.financer_id is not None:
@@ -621,11 +622,25 @@ def financer_supports(financer, loan_type):
     return financer is not None and loan_type in financer.loan_type_list()
 
 
-def auto_financer_id(loan_type):
-    """The lender to use when exactly one active lender funds this loan
-    type. With several, staff choose on the loan application."""
-    matches = active_financers_for(loan_type)
-    return matches[0].financer_id if len(matches) == 1 else None
+def buyer_lender_choices(deal):
+    """The lenders the buyer may choose on the loan form: active, funding
+    this deal's loan type, and serving the deal's area by the same rule as
+    the public partner list (GET /api/financers?pincode=): an all-India
+    lender always, a local one only within the postal circle. The area is
+    the listing's pincode, else the buyer's. Nearest first, then by name."""
+    from financers.routes import proximity_rank
+    product = Product.query.get(deal.product_id)
+    pincode = ((product.city if product else None) or "").strip()
+    if not pincode:
+        buyer = User.query.get(deal.buyer_id)
+        pincode = ((buyer.city if buyer else None) or "").strip()
+    out = active_financers_for(deal.loan_type)
+    if pincode:
+        out = [f for f in out if f.serves_all_india or proximity_rank(f, pincode)[0] <= 1]
+        out.sort(key=lambda f: proximity_rank(f, pincode))
+    else:
+        out.sort(key=lambda f: (f.name or "").lower())
+    return out
 
 
 def deal_documents(deal):
@@ -736,8 +751,9 @@ def confirm_deal(deal, seller, outbox):
     if not deal.handover_code:
         deal.handover_code = new_handover_code()
         deal.handover_code_attempts = 0
-    if not deal.financer_id:
-        deal.financer_id = auto_financer_id(deal.loan_type)
+    # No lender is set here: the buyer chooses one on the loan form, after
+    # the deal locks. Until then any active lender funding this loan type
+    # may check the documents (lender_may_check).
     add_event(deal, "seller_confirmed", seller.id,
               reserved_until=deal.reserved_until.isoformat() + "Z")
 

@@ -44,8 +44,7 @@ Both sides read a deal warning before the deal is locked: first the buyer
 accepting offers needs no warning.
 
   Staff (lender-side steps done by hand for lenders without portal users):
-    GET  /api/deals/staff/queue               deals needing attention
-    POST /api/deals/staff/<id>/financer       set the deal's lender
+    GET  /api/deals/staff/queue?status=       deals needing attention (status=all: every deal)
     POST /api/deals/staff/<id>/ready-to-pay   loan sanctioned, meeting can be booked
     POST /api/deals/staff/<id>/paid           lender paid the seller (UTR)
     POST /api/deals/staff/<id>/resolve        close a dispute
@@ -67,10 +66,10 @@ from flask_jwt_extended import jwt_required
 from sqlalchemy.exc import IntegrityError
 
 from extensions import db
-from models import Deal, DealDocument, DealEvent, DealOffer, Financer, Product, User
+from models import Deal, DealDocument, DealEvent, DealOffer, Product, User
 from models.deal import (CONFIRMED_STATES, DEAL_AWAITING_SELLER, DEAL_DISPUTED,
                          DEAL_DOCS_PENDING,
-                         DEAL_LOAN_IN_PROGRESS, DEAL_LOCKED, DEAL_PAID, DEAL_READY_TO_PAY,
+                         DEAL_LOAN_IN_PROGRESS, DEAL_PAID, DEAL_READY_TO_PAY,
                          DOC_APPROVED, DOC_REJECTED, DOC_UPLOADED,
                          LIVE_DEAL_STATES, LOAN_VEHICLE, OFFER_ACCEPTED,
                          OFFER_COUNTERED, OFFER_DECLINED, OFFER_EXPIRED,
@@ -85,7 +84,7 @@ from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_vie
                       clean_utr, complete_deal, confirm_deal, display_name,
                       docs_all_approved, docs_checklist, docs_question_pending,
                       force_cancel, party_docs_uploaded, request_cancel, withdraw_cancel,
-                      financer_name, financer_supports, has_chat_thread, inr,
+                      financer_name, has_chat_thread, inr,
                       lender_financer_id, listing_blocked_reason,
                       live_deal_for_product, loan_summary, lock_deal,
                       mark_paid, mark_ready_to_pay, new_handover_code, notify,
@@ -1467,15 +1466,19 @@ def _staff_row(deal, products, users):
 @bp.route("/staff/queue", methods=["GET"])
 @require_capability("deals.view")
 def staff_queue():
-    """?status=<one deal status>, or by default every deal that is still
-    moving (awaiting seller through disputed)."""
+    """?status=<one deal status>, ?status=all for every deal whatever its
+    state, or by default every deal that is still moving (awaiting seller
+    through disputed)."""
     status = (request.args.get("status") or "").strip()
     q = Deal.query
-    if status:
+    limit = 200
+    if status == "all":
+        limit = 500
+    elif status:
         q = q.filter(Deal.status == status)
     else:
         q = q.filter(Deal.status.in_(LIVE_DEAL_STATES))
-    deals = q.order_by(Deal.updated_at.desc()).limit(200).all()
+    deals = q.order_by(Deal.updated_at.desc()).limit(limit).all()
     pids = {d.product_id for d in deals}
     uids = {d.buyer_id for d in deals} | {d.seller_id for d in deals}
     products = {p.id: p for p in Product.query.filter(Product.id.in_(pids)).all()} if pids else {}
@@ -1487,36 +1490,9 @@ def _staff_deal(deal_id):
     return Deal.query.filter_by(id=deal_id).with_for_update().first()
 
 
-@bp.route("/staff/<deal_id>/financer", methods=["POST"])
-@require_capability("deals.manage")
-def staff_set_financer(deal_id):
-    """{financer_id} or {financer_id: null}. Which lender handles this deal,
-    so that lender's people can check the documents and the loan. Only
-    before the loan is applied for; after that, change it on the EMI
-    application."""
-    staff = current_user()
-    deal = _staff_deal(deal_id)
-    if not deal:
-        return _err("Deal not found.", 404)
-    if deal.status not in (DEAL_AWAITING_SELLER, DEAL_DOCS_PENDING, DEAL_LOCKED):
-        return _err("The lender can only be changed here before the loan is applied for.", 409)
-    fid = _body().get("financer_id")
-    if fid in (None, "", 0):
-        deal.financer_id = None
-        name = None
-    else:
-        f = Financer.query.get(fid)
-        if not f:
-            return _err("Unknown lender.", 400)
-        if not financer_supports(f, deal.loan_type):
-            return _err(f"{f.name} doesn't fund {deal.loan_type} loans.", 409)
-        deal.financer_id = f.financer_id
-        name = f.name
-    add_event(deal, "lender_set", staff.id, lender=name)
-    failed = _commit_or_conflict()
-    if failed:
-        return failed
-    return jsonify(deal.to_dict())
+# The lender of a deal is the one the BUYER chooses on the loan form
+# (POST /api/loans/apply). Staff no longer set it on the deal; staff who
+# review EMI applications can still correct it on the EMI application.
 
 
 @bp.route("/staff/<deal_id>/lender-email", methods=["POST"])

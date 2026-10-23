@@ -5,17 +5,34 @@ DealLock deals here, in the "Lender portal" tab of the admin panel.
 Who can use it
   - users with the lender role (capability lender.portal) who are linked to
     one lender in financer_members. They only ever see that lender's work.
+    A lender user who isn't linked yet chooses their company once in the
+    portal (POST /firm); after that only a superadmin can change it (Admin,
+    Users, Assign role, Lender). They can ask a superadmin from the portal.
   - DealBriz staff with deals.manage, who pick a lender with ?financer_id=
     (to help, or to see what a lender sees).
 
-    GET  /api/lender/me                        who am I working for
+    GET  /api/lender/me                        who am I working for (or, for a
+                                               lender user not linked yet,
+                                               needs_firm and the companies)
+    POST /api/lender/firm                      {financer_id}: a lender user
+                                               chooses their company, once
+    POST /api/lender/firm/change-request       {message}: ask the superadmins
+                                               to change it
+    PUT  /api/lender/settings                  {docs_email}: where loan
+                                               applications are emailed
     GET  /api/lender/loans?status=             my lender's loan applications
     GET  /api/lender/loans/<id>                one, with its deal and timeline
     POST /api/lender/loans/<id>/status         {status: review|approved|rejected,
                                                 decision_notes}
     POST /api/lender/loans/<id>/details        {nbfc_application_reference, kfs_url}
-    GET  /api/lender/deals?status=             my lender's deals (incl. documents
-                                               waiting for a check)
+    GET  /api/lender/deals?status=             my lender's deals: the ones whose
+                                               buyer chose this lender. status=
+                                               docs_pending also lists deals at
+                                               the documents step with no lender
+                                               yet, of a loan type it funds (the
+                                               buyer chooses after the documents
+                                               are verified); status=all: every
+                                               deal of this lender
     POST /api/lender/deals/<id>/ready-to-pay   {note}
     POST /api/lender/deals/<id>/paid           {utr}
 
@@ -27,16 +44,19 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 from sqlalchemy.exc import IntegrityError
 
+from datetime import timedelta
+
 from extensions import db
 from emi.status import set_emi_status
-from models import Deal, EmiApplication, Financer, LoanStatusEvent, Product, User
+from models import (Deal, EmiApplication, Financer, FinancerMember, LoanStatusEvent, Notification,
+                    Product, User)
 from models.deal import DEAL_DOCS_PENDING, LIVE_DEAL_STATES
 from permissions import has_capability
-from utils import current_user
+from utils import current_user, get_user_role_names, is_superadmin
 from deals import rules
 from deals.service import (Outbox, apply_loan_status_to_deal, clean_utr, financer_name, loan_summary,
                            display_name, docs_checklist, docs_question_pending, lender_financer_id,
-                           mark_paid, mark_ready_to_pay)
+                           mark_paid, mark_ready_to_pay, staff_user_ids, utcnow)
 
 bp = Blueprint("lender", __name__, url_prefix="/api/lender")
 
@@ -44,6 +64,11 @@ bp = Blueprint("lender", __name__, url_prefix="/api/lender")
 # "Paid" on the deal (with the UTR); cancelled and completed stay with staff.
 LENDER_LOAN_STATUSES = ("review", "approved", "rejected")
 RACE_MESSAGE = "Something changed while you were doing that. Please refresh and try again."
+NOT_LINKED_MESSAGE = "Choose your company in the Lender portal first."
+# Bell notifications to the superadmins about a lender user's company.
+# link_ref holds the lender user's id.
+FIRM_KIND = "lender_firm"
+FIRM_REQUEST_GAP_MINUTES = 10
 
 
 def _err(message, code):
@@ -69,9 +94,37 @@ def _scope():
             return user, None, _err("Unknown lender.", 404)
         return user, financer, None
     if has_capability(user, "lender.portal"):
-        return user, None, _err("Your account isn't linked to a lender yet. "
-                                "Ask a DealBriz superadmin to set it.", 403)
+        return user, None, _err(NOT_LINKED_MESSAGE, 403)
     return user, None, _err("You don't have permission to do that.", 403)
+
+
+def _is_lender_user(user):
+    """A user with the lender role (not staff who were also given the
+    portal capability): only they choose a company for themselves."""
+    return (user is not None and has_capability(user, "lender.portal")
+            and "lender" in get_user_role_names(user.id))
+
+
+def _firm_choices():
+    return [{"financer_id": f.financer_id, "name": f.name, "loan_types": f.loan_type_list()}
+            for f in Financer.query.filter_by(status="active").order_by(Financer.name).all()]
+
+
+def _superadmin_ids():
+    out = []
+    for uid in staff_user_ids("users.assign_role"):
+        u = User.query.get(uid)
+        if u is not None and is_superadmin(u):
+            out.append(uid)
+    return out
+
+
+def _tell_superadmins(user, title, body):
+    """Bell notification for every superadmin. Not committed here."""
+    ids = _superadmin_ids()
+    for uid in ids:
+        Notification.push(uid, FIRM_KIND, title[:200], body=body, link_page="admin", link_ref=user.id)
+    return len(ids)
 
 
 def _commit():
@@ -122,10 +175,13 @@ def me():
     fid = lender_financer_id(user)
     financer = Financer.query.get(fid) if fid else None
     can_choose = fid is None and has_capability(user, "deals.manage")
+    if not financer and not can_choose and _is_lender_user(user):
+        # Not linked yet: the portal asks which company they are with.
+        return jsonify({"financer": None, "needs_firm": True, "firms": _firm_choices(),
+                        "can_choose_financer": False})
     if not financer and not can_choose:
         if has_capability(user, "lender.portal"):
-            return _err("Your account isn't linked to a lender yet. "
-                        "Ask a DealBriz superadmin to set it.", 403)
+            return _err(NOT_LINKED_MESSAGE, 403)
         return _err("You don't have permission to do that.", 403)
     out = {"financer": financer.to_dict() if financer else None,
            "can_choose_financer": can_choose,
@@ -137,6 +193,77 @@ def me():
                              "docs_email": f.docs_email}
                             for f in Financer.query.order_by(Financer.name).all()]
     return jsonify(out)
+
+
+@bp.route("/firm", methods=["POST"])
+@jwt_required()
+def choose_firm():
+    """{financer_id}: a lender user says which lender (company) they work
+    for. Once only: after that the company is locked and only a superadmin
+    can change it (Admin, Users). The superadmins are told, so a wrong
+    choice is caught."""
+    user = current_user()
+    if not user or (user.account_status or "active") != "active":
+        return _err("Please sign in again.", 401)
+    if not _is_lender_user(user):
+        return _err("Only lender users choose a company here.", 403)
+    existing = FinancerMember.query.get(user.id)
+    if existing is not None:
+        name = financer_name(existing.financer_id) or "a lender"
+        return _err(f"Your company is already set to {name}. Only a DealBriz superadmin can change it.", 409)
+    data = request.get_json(silent=True) or {}
+    try:
+        fid = int(data.get("financer_id"))
+    except (TypeError, ValueError):
+        return _err("Choose your company.", 400)
+    financer = Financer.query.get(fid)
+    if financer is None or (financer.status or "active") != "active":
+        return _err("Choose a company from the list.", 400)
+    db.session.add(FinancerMember(user_id=user.id, financer_id=financer.financer_id, added_by=user.id))
+    who = display_name(user)
+    _tell_superadmins(user, f"Lender company chosen · {who}",
+                      f"{who} ({user.email}) chose {financer.name} as their company in the Lender portal. "
+                      "It is now locked. To change it: Admin, Users, Assign role, Lender.")
+    failed = _commit()
+    if failed:
+        return failed
+    return jsonify({"financer": financer.to_dict()})
+
+
+@bp.route("/firm/change-request", methods=["POST"])
+@jwt_required()
+def firm_change_request():
+    """{message}: a lender user asks the superadmins to change (or set)
+    their company. Sent as a bell notification to every superadmin."""
+    user = current_user()
+    if not user or (user.account_status or "active") != "active":
+        return _err("Please sign in again.", 401)
+    if not _is_lender_user(user):
+        return _err("Only lender users can send this.", 403)
+    message = " ".join(str((request.get_json(silent=True) or {}).get("message") or "").split())
+    if len(message) < 5:
+        return _err("Say which company you are with and what should change.", 400)
+    message = message[:500]
+    since = utcnow() - timedelta(minutes=FIRM_REQUEST_GAP_MINUTES)
+    recent = (Notification.query.filter(Notification.kind == FIRM_KIND, Notification.link_ref == user.id,
+                                        Notification.created_at >= since,
+                                        Notification.title.like("Lender company change request%"))
+              .first())
+    if recent is not None:
+        return _err("Your request was sent a few minutes ago. A superadmin will get back to you.", 429)
+    member = FinancerMember.query.get(user.id)
+    current = financer_name(member.financer_id) if member else None
+    who = display_name(user)
+    sent = _tell_superadmins(user, f"Lender company change request · {who}",
+                             f"{who} ({user.email}, {user.phone or 'no phone'}), now set to "
+                             f"{current or 'no company yet'}, asks: {message}")
+    if not sent:
+        db.session.rollback()
+        return _err("No superadmin could be reached. Please email support@dealbriz.com.", 503)
+    failed = _commit()
+    if failed:
+        return failed
+    return jsonify({"ok": True})
 
 
 @bp.route("/settings", methods=["PUT"])

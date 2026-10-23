@@ -1,7 +1,10 @@
 """
 DealLock loans (phase 2, manual mode).
 
-    POST /api/loans/apply        buyer applies for the loan on a locked deal
+    GET  /api/loans/lenders?deal_id=   the lenders the buyer may choose for
+                                       a locked deal (see buyer_lender_choices)
+    POST /api/loans/apply        buyer applies for the loan on a locked deal,
+                                 with the lender they chose (financer_id)
     GET  /api/loans/<id>         the loan and its status timeline
 
 A loan here is an EMI application (emi_applications) linked to a deal. Staff
@@ -18,20 +21,42 @@ from flask_jwt_extended import jwt_required
 from sqlalchemy.exc import IntegrityError
 
 from extensions import db
-from models import Deal, EmiApplication, Financer, LoanStatusEvent, Product
+from models import Deal, EmiApplication, LoanStatusEvent, Product
 from models.deal import (DEAL_AWAITING_SELLER, DEAL_DOCS_PENDING,
                          DEAL_LOAN_IN_PROGRESS, DEAL_LOCKED, LOAN_VEHICLE)
 from utils import current_user
-from deals.service import (Outbox, add_event, add_loan_event, auto_financer_id,
-                           financer_name, financer_supports,
+from deals.service import (Outbox, add_event, add_loan_event, buyer_lender_choices,
+                           financer_name,
                            lender_financer_id, notify, notify_lender,
                            post_thread_message, short_date, utcnow)
 
 bp = Blueprint("loans", __name__, url_prefix="/api/loans")
 
+NO_LENDER_MESSAGE = ("No lending partner is available for this loan yet. "
+                     "Please contact DealBriz support.")
+
 
 def _err(message, code):
     return jsonify({"error": message}), code
+
+
+@bp.route("/lenders", methods=["GET"])
+@jwt_required()
+def lenders_for_deal():
+    """?deal_id=  The lenders the buyer of this deal may choose on the loan
+    form: [{financer_id, name}], nearest first. Names only: a lender's
+    documents email and contacts are internal."""
+    user = current_user()
+    if not user or (user.account_status or "active") != "active":
+        return _err("Please sign in again.", 401)
+    deal = Deal.query.get(request.args.get("deal_id") or "")
+    if not deal or user.id != deal.buyer_id:
+        return _err("Deal not found.", 404)
+    return jsonify({
+        "loan_type": deal.loan_type,
+        "lenders": [{"financer_id": f.financer_id, "name": f.name}
+                    for f in buyer_lender_choices(deal)],
+    })
 
 
 @bp.route("/apply", methods=["POST"])
@@ -39,14 +64,16 @@ def _err(message, code):
 def apply_for_loan():
     """Start the loan for a locked deal, either by linking an EMI application
     the buyer already sent for this listing:
-        {deal_id, emi_application_id}
+        {deal_id, financer_id, emi_application_id}
     or by sending the same fields as POST /api/emi, which then sizes the loan
     on the deal's agreed price:
-        {deal_id, tenure_months, interest_rate, loan_amount, monthly_emi,
-         total_payable, down_payment, applicant_name, applicant_phone,
-         applicant_income}
-    The deal moves to Loan in progress. The 7-day reservation keeps running
-    until the lender marks it Ready to pay."""
+        {deal_id, financer_id, tenure_months, interest_rate, loan_amount,
+         monthly_emi, total_payable, down_payment, applicant_name,
+         applicant_phone, applicant_income}
+    financer_id is the lender the BUYER chose (one of GET /lenders). It
+    becomes the application's and the deal's lender, and the documents
+    email goes to that lender only. The deal moves to Loan in progress. The
+    7-day reservation keeps running until the lender marks it Ready to pay."""
     user = current_user()
     if not user or (user.account_status or "active") != "active":
         return _err("Please sign in again.", 401)
@@ -64,6 +91,20 @@ def apply_for_loan():
             return _err("The deal locks once the documents are verified. "
                         "You can apply for the loan then.", 409)
         return _err(f"This deal is {deal.status}; a loan can only be applied for on a locked deal.", 409)
+
+    # The lender the buyer chose. Checked against the same list the form
+    # showed, so a stale page or a crafted request can't pick a lender that
+    # is inactive, doesn't fund this loan type or doesn't serve the area.
+    choices = buyer_lender_choices(deal)
+    if not choices:
+        return _err(NO_LENDER_MESSAGE, 409)
+    try:
+        chosen_id = int(data.get("financer_id"))
+    except (TypeError, ValueError):
+        return _err("Choose your lender.", 400)
+    chosen = next((f for f in choices if f.financer_id == chosen_id), None)
+    if chosen is None:
+        return _err("That lender isn't available for this loan. Please choose another.", 409)
 
     if data.get("emi_application_id"):
         app = (EmiApplication.query.filter_by(id=data["emi_application_id"])
@@ -89,28 +130,20 @@ def apply_for_loan():
         db.session.add(app)
         linked_existing = False
 
-    # The lender: the one already on the deal, else the only active lender
-    # that funds this loan type. With several, staff choose on the EMI
-    # application in the admin panel.
-    if app.financer_id:
-        current = Financer.query.get(app.financer_id)
-        if not financer_supports(current, deal.loan_type):
-            return _err(f"That EMI application's lender doesn't fund {deal.loan_type} loans. "
-                        "Please apply again.", 409)
-    else:
-        app.financer_id = deal.financer_id or auto_financer_id(deal.loan_type)
+    # The buyer's choice is the lender, for the application (also a linked
+    # earlier one) and for the deal.
+    app.financer_id = chosen.financer_id
 
     now = utcnow()
     app.deal_id = deal.id
     db.session.flush()
     deal.status = DEAL_LOAN_IN_PROGRESS
     deal.loan_applied_at = now
-    if app.financer_id:
-        deal.financer_id = app.financer_id
+    deal.financer_id = chosen.financer_id
     add_loan_event(app, app.status, "buyer", user.id,
-                   "Existing application linked to the deal" if linked_existing
-                   else "Applied for this deal")
-    add_event(deal, "loan_applied", user.id, application_id=app.id)
+                   ("Existing application linked to the deal" if linked_existing
+                    else "Applied for this deal") + f", lender chosen by the buyer: {chosen.name}")
+    add_event(deal, "loan_applied", user.id, application_id=app.id, lender=chosen.name)
 
     product = Product.query.get(deal.product_id)
     title = product.title if product else "the listing"
