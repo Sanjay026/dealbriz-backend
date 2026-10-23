@@ -60,6 +60,7 @@ def list_financers():
     result = []
     for f in financers:
         d = f.to_dict()
+        d.pop("docs_email", None)   # internal: where loan documents are emailed
         if pincode:
             rank = proximity_rank(f, pincode)[0]
             d["proximity"] = PROXIMITY_LABELS.get(rank, "Nationwide")

@@ -94,7 +94,10 @@ def queue():
     for p in products:
         have = by.get(p.id, {})
         s = ld.summary(p, have)
-        if want != "all" and s["state"] != want:
+        # "To check" also lists listings with every file in but the loan
+        # question unanswered: the checker can answer it from the RC.
+        waiting_answer = s["question_pending"] and s["needed"] and s["uploaded"] >= s["needed"]
+        if want != "all" and s["state"] != want and not (want == ld.STATE_CHECKING and waiting_answer):
             continue
         uploaded = [d.uploaded_at for d in have.values() if d.status == DOC_UPLOADED and d.uploaded_at]
         seller = sellers.get(p.posted_by)
@@ -133,12 +136,15 @@ def get_listing_docs(pid):
 @jwt_required()
 def loan_answer(pid):
     """{had_loan: true|false}: has this vehicle ever had a loan on it (a
-    bank's name on the RC)? Yes adds the old lender's NOC to the list."""
+    bank's name on the RC)? Yes adds the old lender's NOC to the list.
+    The seller answers; a superadmin or lender checking the documents can
+    answer too, from the RC ("hypothecated to"), when the seller didn't."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
     product = _product(pid, lock=True)
-    if not product or user.id != product.posted_by:
+    owner = product is not None and user.id == product.posted_by
+    if not product or not (owner or ld.can_review(user, product)):
         return _err("Not found.", 404)
     if not rules.is_vehicle_category(product.category):
         return _err("This question is only for cars and bikes.", 409)
@@ -155,6 +161,12 @@ def loan_answer(pid):
         deal = ld.live_deal(product.id)
         if deal is not None:
             deal.vehicle_had_loan = had   # kept in step for the deal's own record
+        if not owner:
+            ld.notify_seller(
+                product, "Loan question answered",
+                ("DealBriz checked your RC: the vehicle had a loan, so upload the loan NOC and Form 35 "
+                 "from My Listings, Edit listing.") if had else
+                "DealBriz checked your RC and noted that the vehicle never had a loan.")
         outbox = Outbox()
         ld.after_change(product, before, user.id, outbox)
         failed = _commit()
@@ -182,7 +194,9 @@ def upload(pid, doc_type):
         return _err("This listing doesn't need documents.", 409)
     if ld.frozen_by(product.id):
         return _err(FROZEN_MESSAGE, 409)
-    if doc_type in rules.VEHICLE_LOAN_DOCS and ld.question_pending(product):
+    # The answer decides the list, and a listing can't be verified without
+    # it, so it comes first.
+    if ld.question_pending(product):
         return _err("First say whether the vehicle ever had a loan on it.", 409)
     if doc_type not in ld.required(product):
         return _err("That document isn't needed for this listing.", 409)
@@ -305,7 +319,7 @@ def review(pid, doc_id):
     rejected_key = None
     if decision == "reject" and doc.storage_key:
         # A rejected file isn't kept: it may be exactly what must not be
-        # stored (a full Aadhaar, someone else's PAN).
+        # stored (someone else's document, an unreadable photo).
         rejected_key = doc.storage_key
         doc.storage_key = None
         doc.deleted_at = now

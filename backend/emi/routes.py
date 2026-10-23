@@ -44,18 +44,36 @@ def build_emi_application(user, data, price_override=None):
     from models import Product
 
     pincode = (data.get("pincode") or "").strip() or None
+    from_listing = False
     if not pincode and data.get("product_id"):
         product = Product.query.get(data["product_id"])
         if product:
-            pincode = product.city  # Product.city holds the listing's pincode
+            pincode = (product.city or "").strip() or None  # Product.city holds the listing's pincode
+            from_listing = bool(pincode)
     if not pincode:
         pincode = (user.city or "").strip() or None
 
     availability = resolve_emi_availability(pincode=pincode)
+    # A listing pincode the pincode table doesn't know (a typo, or a new
+    # pincode) can't be placed in any state: use the buyer's own instead of
+    # refusing outright.
+    buyer_pin = (user.city or "").strip() or None
+    if (not availability.get("available") and from_listing and availability.get("pincode_known") is False
+            and buyer_pin and buyer_pin != pincode):
+        availability = resolve_emi_availability(pincode=buyer_pin)
+        from_listing = False
     if not availability.get("available"):
+        where = availability.get("place")
+        checked = availability.get("pincode")
+        if checked:
+            msg = (f"EMI isn't available yet for {'this listing’s' if from_listing else 'your'} area "
+                   f"(pincode {checked}{', ' + where if where else ''}).")
+        else:
+            msg = availability.get("message", "EMI is not available in your area yet.")
         return None, (jsonify({
-            "error": availability.get("message", "EMI is not available in your area yet."),
+            "error": msg,
             "reason": availability.get("reason"),
+            "pincode": checked,
         }), 403)
     # Snapshot of the listing as it was when the buyer applied. Taken from
     # the database when the listing exists, so the stored title and price

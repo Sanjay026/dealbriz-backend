@@ -69,9 +69,9 @@ LOAN_VEHICLE = "vehicle"
 LOAN_PERSONAL = "personal"
 
 # Every document a buyer or seller can be asked for. Order is the order shown.
-# Aadhaar is accepted only masked (first 8 digits hidden, as UIDAI's own
-# "masked Aadhaar" download does): a full Aadhaar number must not be
-# collected or stored by a marketplace.
+# Aadhaar and PAN are accepted as they are (a full Aadhaar card is fine,
+# 22 Oct 2026). The files are private: only superadmins and the lender open
+# them, and they are deleted 30 days after the deal closes.
 DOC_TYPES = {
     "rc":             {"label": "Registration Certificate (RC)",
                        "hint": "Both sides of the RC card, or the RC page from mParivahan/DigiLocker."},
@@ -81,23 +81,26 @@ DOC_TYPES = {
                        "hint": "Valid Pollution Under Control certificate."},
     "seller_pan":     {"label": "Seller's PAN card",
                        "hint": "The lender needs the seller's PAN to pay you."},
-    "seller_aadhaar": {"label": "Seller's Aadhaar (masked)",
-                       "hint": "Only a masked Aadhaar, with the first 8 digits hidden. Download it from myAadhaar or DigiLocker."},
+    "seller_aadhaar": {"label": "Seller's Aadhaar card",
+                       "hint": "Both sides of the Aadhaar card as a clear photo, or the e-Aadhaar PDF from myAadhaar or DigiLocker."},
     "bank_proof":     {"label": "Bank proof",
                        "hint": "A cancelled cheque or the first page of your passbook, for the account the lender pays into."},
     "loan_noc":       {"label": "Loan NOC and Form 35",
                        "hint": "From the bank that financed this vehicle, showing the loan is closed."},
     "buyer_pan":      {"label": "Buyer's PAN card",
                        "hint": "Your own PAN card. The lender needs it for the loan."},
-    "buyer_aadhaar":  {"label": "Buyer's Aadhaar (masked)",
-                       "hint": "Only a masked Aadhaar, with the first 8 digits hidden. Download it from myAadhaar or DigiLocker."},
+    "buyer_aadhaar":  {"label": "Buyer's Aadhaar card",
+                       "hint": "Both sides of your Aadhaar card as a clear photo, or the e-Aadhaar PDF from myAadhaar or DigiLocker."},
 }
 # Who uploads each document. Phase 5: the seller's documents belong to the
 # LISTING (listing_documents), uploaded when posting or from Edit listing.
 # In a deal only the buyer uploads (deal_documents).
 BUYER_DOC_TYPES = ("buyer_pan", "buyer_aadhaar")
 DOC_PARTY = {t: ("buyer" if t in BUYER_DOC_TYPES else "seller") for t in DOC_TYPES}
-VEHICLE_DOCS = ("rc", "insurance", "puc", "seller_pan", "seller_aadhaar", "bank_proof")
+# The seller's PAN and Aadhaar are NOT asked for (21 Oct 2026): the vehicle
+# papers and the bank account the lender pays into are enough. The types
+# stay defined so older uploads still have a label.
+VEHICLE_DOCS = ("rc", "insurance")
 # Added for vehicles the seller says had a loan (hypothecation on the RC).
 VEHICLE_LOAN_DOCS = ("loan_noc",)
 PERSONAL_DOCS = tuple(d for d in _list_env("DEALLOCK_PERSONAL_DOCS", "")
@@ -130,7 +133,9 @@ def public_rules():
         "doc_types": [{"type": k, "label": v["label"], "hint": v["hint"], "party": DOC_PARTY[k]}
                       for k, v in DOC_TYPES.items()],
         # Seller documents on the listing, by kind of listing.
-        "listing_docs": {"vehicle": list(VEHICLE_DOCS), "vehicle_loan_extra": list(VEHICLE_LOAN_DOCS),
+        # The loan question and its NOC are gone (22 Oct 2026): kept as an
+        # empty list so older clients reading it don't break.
+        "listing_docs": {"vehicle": list(VEHICLE_DOCS), "vehicle_loan_extra": [],
                          "other": list(PERSONAL_DOCS)},
         "buyer_docs": list(BUYER_DOCS),
         "doc_max_mb": DOC_MAX_BYTES // (1024 * 1024),
@@ -182,6 +187,14 @@ def is_vehicle_category(category):
     return (category or "").lower() in VEHICLE_CATEGORIES
 
 
+def listing_possible_docs(category):
+    """Every seller document a listing of this category can ever need (the
+    loan NOC included). Older uploads of other types are not shown."""
+    if is_vehicle_category(category):
+        return list(VEHICLE_DOCS)
+    return list(PERSONAL_DOCS)
+
+
 def listing_required_docs(category, vehicle_had_loan=None):
     """The documents a listing of this category needs (seller's, on the
     listing). For a vehicle whose loan question isn't answered yet, the
@@ -194,8 +207,6 @@ def listing_required_docs(category, vehicle_had_loan=None):
 def required_docs(loan_type, vehicle_had_loan=None):
     """The documents the SELLER must have verified (on the listing)."""
     if loan_type == LOAN_VEHICLE:
-        docs = list(VEHICLE_DOCS)
-        if vehicle_had_loan:
-            docs += list(VEHICLE_LOAN_DOCS)
-        return docs
+        # RC and insurance only. vehicle_had_loan no longer changes the list.
+        return list(VEHICLE_DOCS)
     return list(PERSONAL_DOCS)

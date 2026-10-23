@@ -184,18 +184,31 @@ def lender_financer_id(user):
     return m.financer_id if m else None
 
 
+def lender_may_check(fid, deal):
+    """A lender's people may check a deal's documents when it is the deal's
+    lender, or, while no lender is set on the deal yet, when it funds that
+    kind of loan (so documents never wait for the loan application to pick
+    a lender)."""
+    if fid is None or deal is None:
+        return False
+    if deal.financer_id is not None:
+        return deal.financer_id == fid
+    if deal.status != DEAL_DOCS_PENDING:
+        return False
+    return any(f.financer_id == fid for f in active_financers_for(deal.loan_type))
+
+
 def can_review_docs(user, deal):
     """Who may open and verify the buyer's and seller's documents: a
-    superadmin, or the deal's own lender (NBFC) in its portal. Nobody else,
-    not other staff roles, and not the buyer or seller themselves once
-    uploaded (they see each file's status, never the file)."""
+    superadmin, or a lender (NBFC) in its portal (see lender_may_check).
+    Nobody else, not other staff roles, and not the buyer or seller
+    themselves once uploaded (they see each file's status, never the file)."""
     if not user:
         return False
     from utils import is_superadmin
     if is_superadmin(user):
         return True
-    fid = lender_financer_id(user)
-    return fid is not None and deal.financer_id == fid
+    return lender_may_check(lender_financer_id(user), deal)
 
 
 def can_view_deal(user, deal):
@@ -208,8 +221,7 @@ def can_view_deal(user, deal):
     from permissions import has_capability
     if has_capability(user, "deals.view"):
         return True
-    fid = lender_financer_id(user)
-    return fid is not None and deal.financer_id == fid
+    return lender_may_check(lender_financer_id(user), deal)
 
 
 def deal_records_exist_for_user(user_id):
@@ -743,7 +755,7 @@ def confirm_deal(deal, seller, outbox):
     due = short_date(deal.reserved_until)
     parts = ["The seller confirmed the deal."]
     if buyer_docs:
-        parts.append(f"Buyer: upload your PAN card and masked Aadhaar in the deal by {due}.")
+        parts.append(f"Buyer: upload your PAN card and Aadhaar card in the deal by {due}.")
     if listing_state == ld.STATE_NEEDED:
         parts.append(f"Seller: upload your vehicle documents on the listing (My Listings, "
                      f"Edit listing) by {due}.")
@@ -771,7 +783,8 @@ def confirm_deal(deal, seller, outbox):
 
 def notify_doc_reviewers(deal, title, body):
     """The people who may check documents: superadmins, plus the deal's
-    lender's own people when one is set."""
+    lender's people, or, while no lender is set, the people of every active
+    lender funding that kind of loan (see lender_may_check)."""
     from utils import is_superadmin
     for uid in staff_user_ids("deals.view"):
         u = User.query.get(uid)
@@ -780,6 +793,9 @@ def notify_doc_reviewers(deal, title, body):
                               link_page="admin", link_ref=deal.product_id)
     if deal.financer_id:
         notify_lender(deal.financer_id, title, body, deal.product_id)
+    elif deal.status == DEAL_DOCS_PENDING:
+        for f in active_financers_for(deal.loan_type):
+            notify_lender(f.financer_id, title, body, deal.product_id)
 
 
 def lender_member_ids(financer_id):
@@ -1118,6 +1134,20 @@ def purge_closed_deal_documents(now, batch=200):
         if not key_in_use_elsewhere(key, deal_doc_id=doc.id):
             doc_storage.delete(key)
     return len(rows)
+
+
+def lock_ready_deals(now, outbox, batch=100):
+    """Safety net: a deal waiting for documents whose documents are all
+    verified locks now, even if the change that completed them didn't lock
+    it (a rule change, such as the seller's PAN no longer being needed)."""
+    deals = (Deal.query.filter(Deal.status == DEAL_DOCS_PENDING)
+             .order_by(Deal.created_at).with_for_update(skip_locked=True).limit(batch).all())
+    n = 0
+    for deal in deals:
+        if docs_all_approved(deal):
+            lock_deal(deal, None, outbox)
+            n += 1
+    return n
 
 
 def release_expired_reservations(now, outbox, batch=100):

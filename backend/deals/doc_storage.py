@@ -1,5 +1,5 @@
 """
-Private storage for DealLock documents (RC, PAN, masked Aadhaar...): the
+Private storage for DealLock documents (RC, PAN, Aadhaar...): the
 seller's on the listing (key deal-docs/listings/<listing id>/...) and the
 buyer's in the deal (key deal-docs/<deal id>/...).
 
@@ -111,6 +111,15 @@ def view_link(key, file_name, content_type):
 
 def local_path(key):
     return _local_path(key)
+
+
+def read_bytes(key):
+    """The file's contents (for attaching it to the lender's email)."""
+    if is_s3():
+        obj = _client().get_object(Bucket=BUCKET, Key=key)
+        return obj["Body"].read()
+    with open(_local_path(key), "rb") as fh:
+        return fh.read()
 
 
 def _sniff(head):

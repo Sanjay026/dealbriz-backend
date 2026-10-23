@@ -97,6 +97,10 @@ class Financer(db.Model):
     # DealLock: which loan types this lender funds, comma separated
     # ("vehicle,personal"). See loan_type_list().
     loan_types = db.Column(db.String(50), nullable=False, default="vehicle,personal")
+    # Where each new DealLock loan application goes, with the buyer's and
+    # the seller's documents attached (up to 3 addresses, comma separated).
+    # Set by the lender in its portal or by staff in Financers.
+    docs_email = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def loan_type_list(self):
@@ -113,6 +117,7 @@ class Financer(db.Model):
             "state": self.state, "pincode": self.pincode,
             "serves_all_india": bool(self.serves_all_india),
             "loan_types": self.loan_type_list(),
+            "docs_email": self.docs_email,
             "created_at": iso_utc(self.created_at)
         }
 

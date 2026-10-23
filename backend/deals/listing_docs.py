@@ -1,12 +1,12 @@
 """
 DealLock phase 5: the seller's documents belong to the LISTING.
 
-A car or bike listing needs the vehicle documents (RC, insurance, PUC, PAN,
-masked Aadhaar, bank proof, plus the loan NOC when the vehicle ever had a
-loan). The seller uploads them when posting, or later from Edit listing.
+A car or bike listing needs the vehicle documents: the RC and the insurance
+policy. Nothing else is asked of the seller (no PAN, Aadhaar, PUC, bank proof
+or loan question). The seller uploads them when posting, or later from Edit listing.
 They are checked once, by a superadmin or by a lender (NBFC) that funds
 vehicle loans, and every deal on the listing uses them. In a deal only the
-buyer uploads (PAN, masked Aadhaar).
+buyer uploads (PAN, Aadhaar).
 
 Who sees what
   the seller (owner)   the checklist with statuses and reasons, never a file
@@ -58,7 +58,9 @@ def needs_docs(product):
 
 
 def question_pending(product):
-    return rules.is_vehicle_category(product.category) and product.vehicle_had_loan is None
+    """The "has this vehicle ever had a loan" question was removed on
+    22 Oct 2026: nothing waits for it any more."""
+    return False
 
 
 def required(product):
@@ -75,10 +77,11 @@ def checklist(product, have=None):
     after the answer changed to no), marked required False."""
     have = documents(product.id) if have is None else have
     need = required(product)
+    possible = rules.listing_possible_docs(product.category)
     out = []
     for doc_type in rules.SELLER_DOC_TYPES:
         doc = have.get(doc_type)
-        if doc_type not in need and doc is None:
+        if doc_type not in need and (doc is None or doc_type not in possible):
             continue
         meta = rules.DOC_TYPES[doc_type]
         out.append({

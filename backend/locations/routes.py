@@ -98,19 +98,28 @@ def resolve_emi_availability(pincode=None, district=None, state=None):
     nowhere regardless of the switch — which is the state to leave things
     in until a financing partner is signed.
     """
+    pincode = (str(pincode).strip() or None) if pincode else None
+    district = (district or "").strip() or None
+    state = (state or "").strip() or None
+    # A pincode can have several post offices, and a few sit across a
+    # district or state border. Every district/state it belongs to is
+    # checked, not just whichever row the database returns first.
+    districts, states = ([district] if district else []), ([state] if state else [])
+    known = None
     if pincode and not (district and state):
-        row = Pincode.query.filter_by(pincode=pincode).first()
-        if row:
-            district = district or row.district
-            state = state or row.state
+        rows = Pincode.query.filter_by(pincode=pincode).all()
+        known = bool(rows)
+        for row in rows:
+            if not district and row.district and row.district not in districts:
+                districts.append(row.district)
+            if not state and row.state and row.state not in states:
+                states.append(row.state)
 
     checks = []
     if pincode:
         checks.append(("pincode", pincode))
-    if district:
-        checks.append(("district", district))
-    if state:
-        checks.append(("state", state))
+    checks += [("district", d) for d in districts]
+    checks += [("state", s) for s in states]
 
     for scope_type, scope_value in checks:
         area = EmiServiceArea.query.filter_by(
@@ -127,8 +136,14 @@ def resolve_emi_availability(pincode=None, district=None, state=None):
                     "matched": f"{scope_type}:{scope_value}",
                     "message": "EMI is not available in your area yet."}
 
-    return {"available": False, "reason": "not_covered",
-            "message": "EMI is not available in your area yet."}
+    out = {"available": False, "reason": "not_covered",
+           "message": "EMI is not available in your area yet."}
+    if pincode:
+        out["pincode"] = pincode
+        out["pincode_known"] = known is not False
+        if states:
+            out["place"] = ", ".join(([districts[0]] if districts else []) + states[:1])
+    return out
 
 
 @bp.route("/emi-availability", methods=["GET"])

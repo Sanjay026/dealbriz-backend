@@ -125,6 +125,9 @@ def apply_for_loan():
         notify_lender(app.financer_id, f"New loan application \u00b7 {title}"[:200],
                       f"{app.applicant_name} applied for {deal.loan_type} loan on a DealLock deal.",
                       deal.product_id)
+    # The lender's email: the application with both sides' documents.
+    from deals import lender_email
+    mail_row = lender_email.queue(deal, app, user.id)
 
     try:
         db.session.commit()
@@ -132,6 +135,8 @@ def apply_for_loan():
         db.session.rollback()
         return _err("Something changed while you were doing that. Please refresh and try again.", 409)
     outbox.send()
+    if mail_row is not None and mail_row.status == lender_email.PENDING:
+        lender_email.send_soon([mail_row.id])
     return jsonify(_loan_view(app, deal)), 201
 
 

@@ -1,0 +1,166 @@
+"""
+DealLock loans (phase 2, manual mode).
+
+    POST /api/loans/apply        buyer applies for the loan on a locked deal
+    GET  /api/loans/<id>         the loan and its status timeline
+
+A loan here is an EMI application (emi_applications) linked to a deal. Staff
+move it through the existing statuses in the admin panel (pending, review,
+approved, rejected); admin/routes.py tells the deal when that happens. Ready
+to pay and Paid are separate staff steps on the deal (deals/routes.py).
+
+Not built yet, because both need a lender's API spec:
+    POST /api/loans/precheck            PAN, OTP and soft credit check
+    POST /api/loans/webhook/<financer>  signed status updates from the lender
+"""
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import jwt_required
+from sqlalchemy.exc import IntegrityError
+
+from extensions import db
+from models import Deal, EmiApplication, Financer, LoanStatusEvent, Product
+from models.deal import (DEAL_AWAITING_SELLER, DEAL_DOCS_PENDING,
+                         DEAL_LOAN_IN_PROGRESS, DEAL_LOCKED, LOAN_VEHICLE)
+from utils import current_user
+from deals.service import (Outbox, add_event, add_loan_event, auto_financer_id,
+                           financer_name, financer_supports,
+                           lender_financer_id, notify, notify_lender,
+                           post_thread_message, short_date, utcnow)
+
+bp = Blueprint("loans", __name__, url_prefix="/api/loans")
+
+
+def _err(message, code):
+    return jsonify({"error": message}), code
+
+
+@bp.route("/apply", methods=["POST"])
+@jwt_required()
+def apply_for_loan():
+    """Start the loan for a locked deal, either by linking an EMI application
+    the buyer already sent for this listing:
+        {deal_id, emi_application_id}
+    or by sending the same fields as POST /api/emi, which then sizes the loan
+    on the deal's agreed price:
+        {deal_id, tenure_months, interest_rate, loan_amount, monthly_emi,
+         total_payable, down_payment, applicant_name, applicant_phone,
+         applicant_income}
+    The deal moves to Loan in progress. The 7-day reservation keeps running
+    until the lender marks it Ready to pay."""
+    user = current_user()
+    if not user or (user.account_status or "active") != "active":
+        return _err("Please sign in again.", 401)
+    data = request.get_json(silent=True) or {}
+
+    deal = Deal.query.filter_by(id=data.get("deal_id")).with_for_update().first()
+    if not deal or user.id != deal.buyer_id:
+        return _err("Deal not found.", 404)
+    if deal.status != DEAL_LOCKED:
+        if deal.status == DEAL_LOAN_IN_PROGRESS:
+            return _err("You've already applied for the loan on this deal.", 409)
+        if deal.status == DEAL_AWAITING_SELLER:
+            return _err("Wait for the seller to confirm the deal first.", 409)
+        if deal.status == DEAL_DOCS_PENDING:
+            return _err("The deal locks once the documents are verified. "
+                        "You can apply for the loan then.", 409)
+        return _err(f"This deal is {deal.status}; a loan can only be applied for on a locked deal.", 409)
+
+    if data.get("emi_application_id"):
+        app = (EmiApplication.query.filter_by(id=data["emi_application_id"])
+               .with_for_update().first())
+        if not app or app.user_id != user.id:
+            return _err("EMI application not found.", 404)
+        if app.product_id != deal.product_id:
+            return _err("That EMI application is for a different listing.", 409)
+        if app.deal_id:
+            return _err("That EMI application is already linked to a deal.", 409)
+        if app.status not in ("pending", "review", "approved"):
+            return _err(f"That EMI application is {app.status}. Please apply again.", 409)
+        if float(app.loan_amount) > float(deal.agreed_price):
+            return _err("That application's loan is more than the agreed price. Please apply again.", 409)
+        linked_existing = True
+    else:
+        from emi.routes import build_emi_application
+        payload = dict(data)
+        payload["product_id"] = deal.product_id
+        app, error = build_emi_application(user, payload, price_override=deal.agreed_price)
+        if error:
+            return error
+        db.session.add(app)
+        linked_existing = False
+
+    # The lender: the one already on the deal, else the only active lender
+    # that funds this loan type. With several, staff choose on the EMI
+    # application in the admin panel.
+    if app.financer_id:
+        current = Financer.query.get(app.financer_id)
+        if not financer_supports(current, deal.loan_type):
+            return _err(f"That EMI application's lender doesn't fund {deal.loan_type} loans. "
+                        "Please apply again.", 409)
+    else:
+        app.financer_id = deal.financer_id or auto_financer_id(deal.loan_type)
+
+    now = utcnow()
+    app.deal_id = deal.id
+    db.session.flush()
+    deal.status = DEAL_LOAN_IN_PROGRESS
+    deal.loan_applied_at = now
+    if app.financer_id:
+        deal.financer_id = app.financer_id
+    add_loan_event(app, app.status, "buyer", user.id,
+                   "Existing application linked to the deal" if linked_existing
+                   else "Applied for this deal")
+    add_event(deal, "loan_applied", user.id, application_id=app.id)
+
+    product = Product.query.get(deal.product_id)
+    title = product.title if product else "the listing"
+    checks = "the buyer and the vehicle" if deal.loan_type == LOAN_VEHICLE else "the buyer"
+    text = (f"The buyer has applied for the loan. The listing stays reserved until "
+            f"{short_date(deal.reserved_until)} while the lender checks {checks}.")
+    post_thread_message(deal.product_id, user.id, deal.seller_id, text, "system")
+    outbox = Outbox()
+    notify(deal.seller_id, f"Loan applied · {title}"[:200], text, deal.product_id)
+    outbox.push(deal.seller_id, f"Loan applied · {title}", text, deal.product_id, user.id)
+    if app.financer_id:
+        notify_lender(app.financer_id, f"New loan application \u00b7 {title}"[:200],
+                      f"{app.applicant_name} applied for {deal.loan_type} loan on a DealLock deal.",
+                      deal.product_id)
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return _err("Something changed while you were doing that. Please refresh and try again.", 409)
+    outbox.send()
+    return jsonify(_loan_view(app, deal)), 201
+
+
+def _loan_view(app, deal):
+    d = app.to_dict()
+    d["lender"] = financer_name(app.financer_id)
+    d["deal"] = deal.to_dict() if deal else None
+    events = (LoanStatusEvent.query.filter_by(application_id=app.id)
+              .order_by(LoanStatusEvent.created_at.asc()).all())
+    d["events"] = [e.to_dict() for e in events]
+    return d
+
+
+@bp.route("/<app_id>", methods=["GET"])
+@jwt_required()
+def get_loan(app_id):
+    """The buyer's own loan, any loan for staff who can view EMI
+    applications, or the lender's own loans. The seller sees loan progress
+    on the deal instead (GET /api/deals/<id>), without the terms."""
+    user = current_user()
+    if not user:
+        return _err("Please sign in again.", 401)
+    app = EmiApplication.query.get(app_id)
+    deal = Deal.query.get(app.deal_id) if app and app.deal_id else None
+    from permissions import has_capability
+    allowed = app is not None and (
+        app.user_id == user.id
+        or has_capability(user, "emi.view")
+        or (lender_financer_id(user) is not None and app.financer_id == lender_financer_id(user)))
+    if not allowed:
+        return _err("Loan not found.", 404)
+    return jsonify(_loan_view(app, deal))

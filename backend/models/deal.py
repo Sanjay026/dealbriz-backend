@@ -32,7 +32,7 @@ OFFER_WITHDRAWN = "withdrawn"
 #                     each within CONFIRM_HOURS. No other buyer can start a
 #                     deal on the listing, but it isn't shown as Reserved.
 #   docs_pending      the seller confirmed. Both sides upload documents
-#                     (buyer: PAN and masked Aadhaar, every deal. Seller: the
+#                     (buyer: PAN card and Aadhaar card, every deal. Seller: the
 #                     vehicle documents, cars and bikes) and the superadmin
 #                     or the deal's lender verifies them, within DOCS_DAYS.
 #   locked            every document verified. NOW the listing is Reserved
@@ -391,7 +391,7 @@ class DealDocument(db.Model):
 
 class ListingDocument(db.Model):
     """A seller document for a LISTING (phase 5): RC, insurance, PUC, PAN,
-    masked Aadhaar, bank proof, loan NOC. Uploaded when posting a car or
+    Aadhaar card, bank proof, loan NOC. Uploaded when posting a car or
     bike, or later from Edit listing, and checked once by a superadmin or a
     lender (NBFC) that funds vehicle loans, so every deal on the listing can
     use them. One row per type per listing; uploading again replaces the
@@ -455,3 +455,36 @@ class OtpCode(db.Model):
     attempts = db.Column(db.Integer, nullable=False, default=0)
     consumed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class DealLenderEmail(db.Model):
+    """One email to a lender (NBFC) about a deal: the loan application with
+    the buyer's and the seller's documents attached. Queued when the buyer
+    applies (or the lender changes, or a lender sets its documents email),
+    sent by deals/lender_email.py, retried by the timer job.
+
+    status: pending -> sending -> sent | failed (retried) | no_email (the
+    lender has no documents email yet; sent once it sets one)."""
+    __tablename__ = "deal_lender_emails"
+    id = db.Column(db.String(36), primary_key=True, default=gen_id)
+    deal_id = db.Column(db.String(36), db.ForeignKey("deals.id", ondelete="CASCADE"), nullable=False, index=True)
+    application_id = db.Column(db.String(36), db.ForeignKey("emi_applications.id", ondelete="SET NULL"))
+    financer_id = db.Column(db.Integer, db.ForeignKey("financers.financer_id", ondelete="SET NULL"))
+    to_email = db.Column(db.String(255))
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    parts = db.Column(db.Integer)
+    last_error = db.Column(db.String(500))
+    requested_by = db.Column(db.String(36), db.ForeignKey("users.id", ondelete="SET NULL"))
+    sent_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "deal_id": self.deal_id, "application_id": self.application_id,
+            "financer_id": self.financer_id, "to_email": self.to_email, "status": self.status,
+            "attempts": self.attempts, "parts": self.parts, "last_error": self.last_error,
+            "sent_at": iso_utc(self.sent_at), "created_at": iso_utc(self.created_at),
+            "updated_at": iso_utc(self.updated_at),
+        }

@@ -34,8 +34,8 @@ from models.deal import DEAL_DOCS_PENDING, LIVE_DEAL_STATES
 from permissions import has_capability
 from utils import current_user
 from deals import rules
-from deals.service import (Outbox, apply_loan_status_to_deal, clean_utr,
-                           display_name, docs_checklist, lender_financer_id,
+from deals.service import (Outbox, apply_loan_status_to_deal, clean_utr, financer_name, loan_summary,
+                           display_name, docs_checklist, docs_question_pending, lender_financer_id,
                            mark_paid, mark_ready_to_pay)
 
 bp = Blueprint("lender", __name__, url_prefix="/api/lender")
@@ -100,6 +100,8 @@ def _deal_brief(deal):
         need = [c for c in docs_checklist(deal) if c["required"]]
         d["docs_to_check"] = sum(1 for c in need if c["status"] == "uploaded")
         d["docs_needed"] = len(need)
+        d["docs_approved"] = sum(1 for c in need if c["status"] == "approved")
+        d["docs_question_pending"] = docs_question_pending(deal)
     return d
 
 
@@ -131,9 +133,35 @@ def me():
            "doc_types": rules.public_rules()["doc_types"]}
     if can_choose:
         out["financers"] = [{"financer_id": f.financer_id, "name": f.name,
-                             "loan_types": f.loan_type_list(), "status": f.status}
+                             "loan_types": f.loan_type_list(), "status": f.status,
+                             "docs_email": f.docs_email}
                             for f in Financer.query.order_by(Financer.name).all()]
     return jsonify(out)
+
+
+@bp.route("/settings", methods=["PUT"])
+@jwt_required()
+def save_settings():
+    """{docs_email}: where this lender receives each new loan application
+    with the buyer's and seller's documents (up to 3 addresses). A lender's
+    own people set it; DealBriz staff who manage lenders can too."""
+    from deals import lender_email
+    user, financer, problem = _scope()
+    if problem:
+        return problem
+    if lender_financer_id(user) is None and not has_capability(user, "financers.manage"):
+        return _err("Only the lender's own team or staff who manage lenders can change this.", 403)
+    data = request.get_json(silent=True) or {}
+    emails, bad = lender_email.parse_emails(data.get("docs_email") or "")
+    if bad:
+        return _err(bad, 400)
+    financer.docs_email = ", ".join(emails) or None
+    ids = lender_email.requeue_for_financer(financer)
+    failed = _commit()
+    if failed:
+        return failed
+    lender_email.send_soon(ids)
+    return jsonify({"financer": financer.to_dict(), "queued": len(ids)})
 
 
 @bp.route("/loans", methods=["GET"])
@@ -264,7 +292,15 @@ def list_deals():
         return problem
     q = Deal.query.filter(Deal.financer_id == financer.financer_id)
     status = (request.args.get("status") or "").strip()
-    if status == "all":
+    if status == DEAL_DOCS_PENDING:
+        # Documents to check: this lender's deals, plus deals with no lender
+        # yet of a kind of loan it funds (see deals.service.lender_may_check).
+        funded = financer.loan_type_list() if (financer.status or "active") == "active" else []
+        own = Deal.financer_id == financer.financer_id
+        unassigned = db.and_(Deal.financer_id.is_(None), Deal.loan_type.in_(funded)) if funded else None
+        q = Deal.query.filter(Deal.status == DEAL_DOCS_PENDING,
+                              db.or_(own, unassigned) if unassigned is not None else own)
+    elif status == "all":
         pass
     elif status:
         q = q.filter(Deal.status == status)
@@ -283,6 +319,9 @@ def list_deals():
         for role in ("buyer", "seller"):
             u = users.get(getattr(deal, f"{role}_id"))
             d[role] = {"name": display_name(u), "phone": u.phone} if u else None
+        # The same row the admin Deals table shows: the loan and the lender.
+        d["loan"] = loan_summary(deal, None, is_staff=True)
+        d["lender"] = financer_name(deal.financer_id)
         out.append(d)
     return jsonify(out)
 

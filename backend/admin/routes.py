@@ -500,6 +500,12 @@ def admin_create_financer():
         state=data.get("state"), pincode=data.get("pincode"),
         serves_all_india=bool(data.get("serves_all_india", True))
     )
+    if data.get("docs_email"):
+        from deals import lender_email
+        emails, problem = lender_email.parse_emails(data.get("docs_email"))
+        if problem:
+            return jsonify({"error": problem}), 400
+        f.docs_email = ", ".join(emails) or None
     db.session.add(f)
     db.session.commit()
     return jsonify(f.to_dict()), 201
@@ -517,12 +523,23 @@ def admin_update_financer(fid):
                   "address_line", "city", "state", "pincode", "serves_all_india"]:
         if field in data:
             setattr(f, field, data[field])
+    mail_ids = []
+    if "docs_email" in data:
+        from deals import lender_email
+        emails, problem = lender_email.parse_emails(data.get("docs_email") or "")
+        if problem:
+            return jsonify({"error": problem}), 400
+        f.docs_email = ", ".join(emails) or None
+        mail_ids = lender_email.requeue_for_financer(f)
     if "loan_types" in data:
         loan_types, problem = _loan_types_value(data["loan_types"])
         if problem:
             return jsonify({"error": problem}), 400
         f.loan_types = loan_types
     db.session.commit()
+    if mail_ids:
+        from deals import lender_email
+        lender_email.send_soon(mail_ids)
     return jsonify(f.to_dict())
 
 
@@ -629,13 +646,21 @@ def update_emi_status(eid):
             db.session.rollback()
             return jsonify({"error": problem}), 409
         deal = Deal.query.get(emi.deal_id)
+        mail_row = None
         if deal and deal.status in ("locked", "loan_in_progress", "ready_to_pay") \
                 and emi.financer_id and deal.financer_id != emi.financer_id:
             deal.financer_id = emi.financer_id
+            # The new lender gets the application and documents by email.
+            if deal.status in ("loan_in_progress", "ready_to_pay"):
+                from deals import lender_email
+                mail_row = lender_email.queue(deal, emi, user.id)
 
     db.session.commit()
     if outbox:
         outbox.send()
+    if emi.deal_id and mail_row is not None and mail_row.status == "pending":
+        from deals import lender_email
+        lender_email.send_soon([mail_row.id])
     return jsonify(emi.to_dict())
 
 

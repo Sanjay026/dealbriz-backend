@@ -70,7 +70,7 @@ from extensions import db
 from models import Deal, DealDocument, DealEvent, DealOffer, Financer, Product, User
 from models.deal import (CONFIRMED_STATES, DEAL_AWAITING_SELLER, DEAL_DISPUTED,
                          DEAL_DOCS_PENDING,
-                         DEAL_LOCKED, DEAL_PAID, DEAL_READY_TO_PAY,
+                         DEAL_LOAN_IN_PROGRESS, DEAL_LOCKED, DEAL_PAID, DEAL_READY_TO_PAY,
                          DOC_APPROVED, DOC_REJECTED, DOC_UPLOADED,
                          LIVE_DEAL_STATES, LOAN_VEHICLE, OFFER_ACCEPTED,
                          OFFER_COUNTERED, OFFER_DECLINED, OFFER_EXPIRED,
@@ -648,6 +648,13 @@ def deal_detail(deal, user):
     # Opening and verifying files: superadmin or the deal's lender only.
     d["can_review_docs"] = deal.status == DEAL_DOCS_PENDING and can_review_docs(user, deal)
     d["can_view_doc_files"] = can_review_docs(user, deal)
+    # The documents email to the lender: staff and the lender see its state.
+    if not is_party and (staff_view or can_review_docs(user, deal)):
+        from . import lender_email
+        d["lender_email"] = lender_email.summary(deal)
+        from permissions import has_capability
+        d["can_resend_lender_email"] = (has_capability(user, "deals.manage")
+                                        and deal.status in (DEAL_LOAN_IN_PROGRESS, DEAL_READY_TO_PAY))
     d["can_enter_handover_code"] = user.id == deal.seller_id and deal.status == DEAL_PAID
     return d
 
@@ -1190,7 +1197,7 @@ def review_document(deal_id, doc_id):
     doc.reviewed_at = now
     doc.reject_reason = reason if decision == "reject" else None
     # A rejected file isn't kept: it may be exactly what must not be stored
-    # (a full, unmasked Aadhaar, someone else's PAN). The row keeps the
+    # (someone else's PAN or Aadhaar, an unreadable photo). The row keeps the
     # reason; the seller uploads a new file.
     rejected_key = None
     if decision == "reject" and doc.storage_key:
@@ -1452,6 +1459,7 @@ def _staff_row(deal, products, users):
             "to_check": sum(1 for c in need if c["status"] == DOC_UPLOADED),
             "approved": sum(1 for c in need if c["status"] == DOC_APPROVED),
             "missing": sum(1 for c in need if c["status"] in ("missing", DOC_REJECTED)),
+            "question_pending": docs_question_pending(deal),
         }
     return d
 
@@ -1509,6 +1517,31 @@ def staff_set_financer(deal_id):
     if failed:
         return failed
     return jsonify(deal.to_dict())
+
+
+@bp.route("/staff/<deal_id>/lender-email", methods=["POST"])
+@require_capability("deals.manage")
+def staff_resend_lender_email(deal_id):
+    """Send the loan application and documents to the deal's lender again
+    (a lost email, a corrected address)."""
+    from . import lender_email
+    staff = current_user()
+    deal = _staff_deal(deal_id)
+    if not deal:
+        return _err("Deal not found.", 404)
+    if deal.status not in (DEAL_LOAN_IN_PROGRESS, DEAL_READY_TO_PAY):
+        return _err("The documents email goes out once the buyer has applied for the loan.", 409)
+    if not deal.financer_id:
+        return _err("Set the lender on the loan application first.", 409)
+    row = lender_email.queue(deal, None, staff.id, force=True)
+    if row is None:
+        return _err("This deal has no loan application yet.", 409)
+    failed = _commit_or_conflict()
+    if failed:
+        return failed
+    if row.status == lender_email.PENDING:
+        lender_email.send_soon([row.id])
+    return jsonify(row.to_dict()), 202
 
 
 @bp.route("/staff/<deal_id>/ready-to-pay", methods=["POST"])

@@ -1,0 +1,81 @@
+"""
+Models package — one module per domain, mirroring the blueprint folders.
+
+    base.py      gen_id() helper shared by every model
+    user.py      User
+    product.py   Product, SavedProduct
+    emi.py       EmiApplication, Financer, FinancerMember
+    rbac.py      Role, Admin
+    purchase.py  Purchase, PurchaseUser
+    message.py   Message
+    report.py    Report
+    legal.py     LegalDocument
+    faq.py       Faq
+    blog.py      BlogPost
+    settings.py  SiteSetting
+    session.py   UserSession
+    location.py  Pincode, EmiServiceArea
+    notification.py  Notification
+    push_device.py   PushDevice
+    deal.py          DealOffer, Deal, DealEvent, LoanStatusEvent, ListingDocument,
+                     DealDocument, OtpCode (DealLock)
+
+Everything is re-exported here, so `from models import User, Product`
+keeps working exactly as before — blueprints don't need to know which
+module a model lives in, and no blueprint ever imports another blueprint.
+
+Two things make this split safe:
+  1. Model modules only import `db` from extensions and `gen_id` from
+     .base — never from each other. So there's no import cycle.
+  2. Foreign keys are declared as strings ("users.id"), which SQLAlchemy
+     resolves lazily at mapper-configuration time. A model can therefore
+     reference a table whose module hasn't been imported yet.
+
+Importing this package imports every module below, which is what
+registers all tables with SQLAlchemy before db.create_all() runs.
+"""
+from .base import gen_id
+from .user import User
+from .product import Product, SavedProduct
+from .emi import EmiApplication, Financer, FinancerMember
+from .rbac import Role, Admin
+from .purchase import Purchase, PurchaseUser
+from .message import Message
+from .report import Report
+from .legal import LegalDocument
+from .faq import Faq
+from .blog import BlogPost
+from .settings import SiteSetting
+from .session import UserSession
+from .location import Pincode, EmiServiceArea
+from .attribute import ProductAttribute
+from .chatbot import ChatbotUnanswered
+from .role_permission import RolePermission, RolePermissionState
+from .notification import Notification
+from .push_device import PushDevice
+from .deal import (DealOffer, Deal, DealEvent, LoanStatusEvent, DealDocument, ListingDocument,
+                   OtpCode)
+
+__all__ = [
+    "gen_id",
+    "User",
+    "Product", "SavedProduct",
+    "EmiApplication", "Financer", "FinancerMember",
+    "Role", "Admin",
+    "Purchase", "PurchaseUser",
+    "Message",
+    "Report",
+    "LegalDocument",
+    "Faq",
+    "BlogPost",
+    "SiteSetting",
+    "UserSession",
+    "Pincode",
+    "EmiServiceArea",
+    "ProductAttribute",
+    "ChatbotUnanswered",
+    "RolePermission", "RolePermissionState",
+    "Notification",
+    "PushDevice",
+    "DealOffer", "Deal", "DealEvent", "LoanStatusEvent", "DealDocument", "ListingDocument", "OtpCode",
+]

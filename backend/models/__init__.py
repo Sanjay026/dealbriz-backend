@@ -17,7 +17,7 @@ Models package — one module per domain, mirroring the blueprint folders.
     location.py  Pincode, EmiServiceArea
     notification.py  Notification
     push_device.py   PushDevice
-    deal.py          DealOffer, Deal, DealEvent, LoanStatusEvent, ListingDocument,
+    deal.py          DealOffer, Deal, DealEvent, LoanStatusEvent, ListingDocument, DealLenderEmail,
                      DealDocument, OtpCode (DealLock)
 
 Everything is re-exported here, so `from models import User, Product`
@@ -53,7 +53,7 @@ from .chatbot import ChatbotUnanswered
 from .role_permission import RolePermission, RolePermissionState
 from .notification import Notification
 from .push_device import PushDevice
-from .deal import (DealOffer, Deal, DealEvent, LoanStatusEvent, DealDocument, ListingDocument,
+from .deal import (DealOffer, Deal, DealEvent, LoanStatusEvent, DealDocument, ListingDocument, DealLenderEmail,
                    OtpCode)
 
 __all__ = [
@@ -77,5 +77,5 @@ __all__ = [
     "RolePermission", "RolePermissionState",
     "Notification",
     "PushDevice",
-    "DealOffer", "Deal", "DealEvent", "LoanStatusEvent", "DealDocument", "ListingDocument", "OtpCode",
+    "DealOffer", "Deal", "DealEvent", "LoanStatusEvent", "DealDocument", "ListingDocument", "DealLenderEmail", "OtpCode",
 ]

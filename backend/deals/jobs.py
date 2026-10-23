@@ -8,9 +8,13 @@ What it does each run:
   - deals not confirmed in time (the buyer didn't accept the warning within
     24 hours, or the seller didn't confirm within 24 hours after that) ->
     released, not counted against anyone, listing back on sale
+  - deals waiting for documents that are all verified -> locked (a safety
+    net, e.g. after a rule change made fewer documents necessary)
   - deals still before Ready to pay when the reservation ends (including
     documents not approved in time) -> released, listing back on sale, both
     sides told, loan application withdrawn
+  - documents emails to lenders that are waiting, failed (retried every 10
+    minutes, up to 6 tries) or stuck -> sent
   - loans with no update for 48 hours -> staff get a bell notification
     (at most once a day per deal)
   - cancel requests nobody answered within 24 hours -> lapse, the one who
@@ -36,14 +40,14 @@ def run():
     from extensions import db
     from deals.listing_docs import purge_listing_documents
     from deals.service import (Outbox, expire_cancel_requests, expire_offers, flag_stalled_loans,
-                               purge_closed_deal_documents,
+                               lock_ready_deals, purge_closed_deal_documents,
                                release_expired_reservations, release_unconfirmed,
                                utcnow)
 
     log = logging.getLogger("dealbridge.deals.jobs")
     with app.app_context():
         now = utcnow()
-        expired = released = unconfirmed = stalled = purged = lapsed = 0
+        expired = released = unconfirmed = stalled = purged = lapsed = locked = mailed = 0
         threads = []
         try:
             # Batches keep each transaction short. Loop until a batch comes
@@ -62,6 +66,16 @@ def run():
                 unconfirmed += n
                 if n < 100:
                     break
+            # Before releasing anything: a deal whose documents are all
+            # verified locks rather than running out of time.
+            while True:
+                outbox = Outbox()
+                n = lock_ready_deals(now, outbox)
+                db.session.commit()
+                threads += outbox.send()
+                locked += n
+                if n < 100:
+                    break
             while True:
                 outbox = Outbox()
                 n = release_expired_reservations(now, outbox)
@@ -78,6 +92,9 @@ def run():
                 lapsed += n
                 if n < 200:
                     break
+            # Documents emails to lenders: waiting, failed or stuck ones.
+            from deals.lender_email import send_due
+            mailed = send_due(now)
             stalled = flag_stalled_loans(now)
             db.session.commit()
             purged = purge_closed_deal_documents(now)
@@ -92,9 +109,10 @@ def run():
         # before this short-lived process exits.
         for t in threads:
             t.join(timeout=10)
-        msg = (f"DealLock timers: {expired} offer(s) expired, {unconfirmed} unconfirmed deal(s) "
+        msg = (f"DealLock timers: {locked} deal(s) locked, {expired} offer(s) expired, {unconfirmed} unconfirmed deal(s) "
                f"released, {released} deal(s) released, {lapsed} cancel request(s) lapsed, "
-               f"{stalled} stalled loan(s) flagged, {purged} document file(s) deleted")
+               f"{stalled} stalled loan(s) flagged, {mailed} lender email(s) sent, "
+               f"{purged} document file(s) deleted")
         log.info(msg)
         print(msg)
         return 0
