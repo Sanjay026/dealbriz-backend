@@ -276,16 +276,32 @@ def party_block_reason(user, who):
     return None
 
 
-def listing_blocked_reason(product):
-    """None if offers can be made on this listing right now."""
+def listing_blocked_reason(product, deallock=True, viewer_is_seller=False):
+    """None if offers can be made on this listing right now. deallock: a
+    DealLock (EMI) offer, which has extra conditions (deallock_block_reason);
+    False for a normal offer."""
     if not product:
         return "That listing no longer exists."
-    if not rules.category_allowed(product.category):
-        return "EMI deals aren't available for this category yet."
     if product.status == PRODUCT_RESERVED:
         return "This listing is reserved for another buyer."
     if product.status != PRODUCT_ACTIVE:
         return "This listing is no longer available."
+    if deallock:
+        return deallock_block_reason(product, viewer_is_seller)
+    return None
+
+
+def deallock_block_reason(product, viewer_is_seller=False):
+    """None if a DealLock (EMI) offer can be made on this listing: the
+    category is open to DealLock and the seller offers EMI on it ("Offer EMI
+    option" in the Sell form). A normal offer needs neither."""
+    if not rules.category_allowed(product.category):
+        return "EMI deals aren't available for this category yet. You can send a normal offer."
+    if product.emi_eligible is False:
+        if viewer_is_seller:
+            return ("You haven't offered EMI on this listing. Turn on \"Offer EMI option\" in "
+                    "Edit listing, or send a normal offer.")
+        return "The seller hasn't offered EMI on this listing. You can send a normal offer."
     return None
 
 

@@ -200,6 +200,83 @@ def get_me():
     return jsonify(data)
 
 
+# ===================== FORGOT PASSWORD (email code) =====================
+# 1. POST /forgot-password {email}: a 6-digit code is emailed (deals/otp.py,
+#    the same code generator as the deal confirmation; only its HMAC is kept).
+#    The answer is the same whether or not an account exists, so the form
+#    can't be used to find out who has an account.
+# 2. POST /reset-password {email, code, new_password}: right code -> new
+#    password, and every device is signed out. The user then signs in.
+RESET_SENT = ("If an account exists for that email, we've sent it a 6-digit code. "
+              "It works for 10 minutes. Check your spam folder too.")
+RESET_BAD_CODE = "That code is wrong or has expired. Ask for a new one."
+EMAIL_RE = r"[^@\s<>\"']+@[^@\s<>\"']+\.[A-Za-z]{2,}"
+
+
+@bp.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    import logging
+    import mailer
+    from deals import otp
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
+    if not re.fullmatch(EMAIL_RE, email) or len(email) > 255:
+        return jsonify({"error": "Please enter a valid email address"}), 400
+    if not mailer.is_configured():
+        return jsonify({"error": "Password reset by email isn't available right now. "
+                                 "Please contact support@dealbriz.com."}), 503
+    out = {"message": RESET_SENT, "expires_in_minutes": otp.CODE_MINUTES,
+           "resend_after_seconds": otp.RESEND_SECONDS}
+    user = User.query.filter_by(email=email).first()
+    if not user or (user.account_status or "active") == "suspended":
+        return jsonify(out)
+    try:
+        otp.send_email_code(user, otp.PURPOSE_PASSWORD_RESET, datetime.utcnow(),
+                            "Your DealBriz password reset code",
+                            "Use this code to set a new password for your DealBriz account.")
+    except otp.OtpError as exc:
+        db.session.rollback()
+        if exc.code == 429:
+            # Too soon or too many: answered like a send, so the reply never
+            # tells whether the account exists. The form waits 60 seconds
+            # between requests anyway.
+            logging.getLogger("dealbridge.auth").info("Password reset code held back: %s", exc.message)
+            return jsonify(out)
+        return jsonify({"error": exc.message}), exc.code
+    db.session.commit()
+    return jsonify(out)
+
+
+@bp.route("/reset-password", methods=["POST"])
+def reset_password():
+    from deals import otp
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
+    new_password = str(data.get("new_password") or "")
+    if not re.fullmatch(EMAIL_RE, email):
+        return jsonify({"error": "Please enter a valid email address"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if len(new_password) > 128:
+        return jsonify({"error": "Password must be at most 128 characters"}), 400
+    user = User.query.filter_by(email=email).first()
+    if not user or (user.account_status or "active") == "suspended":
+        return jsonify({"error": RESET_BAD_CODE}), 400
+    try:
+        otp.check_code(user, otp.PURPOSE_PASSWORD_RESET, None, data.get("code"),
+                       datetime.utcnow(), where="email")
+    except otp.OtpError as exc:
+        db.session.commit()   # keep the wrong-try count
+        if exc.message == "Ask for a code first.":   # no live code (used, replaced or never sent)
+            return jsonify({"error": RESET_BAD_CODE}), 400
+        return jsonify({"error": exc.message}), exc.code
+    user.password_hash = generate_password_hash(new_password)
+    db.session.commit()
+    # The old password may be how someone else got in: sign out everywhere.
+    revoke_all_sessions(user.id)
+    return jsonify({"message": "Password changed. Sign in with your new password."})
+
+
 @bp.route("/change-password", methods=["POST"])
 @jwt_required()
 def change_password():

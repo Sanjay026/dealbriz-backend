@@ -111,6 +111,12 @@ class DealOffer(db.Model):
     round_number = db.Column(db.Integer, nullable=False, default=1)
     status = db.Column(db.String(20), nullable=False, default=OFFER_OPEN)
     note = db.Column(db.String(500))
+    # True: a DealLock offer (EMI through a DealBriz lending partner): once
+    # accepted it becomes a Deal (warning, seller confirm, documents, lock,
+    # loan). False: a normal offer: accepting only agrees the price in the
+    # chat, no Deal, nothing held. Chosen by whoever sends the offer, and
+    # can change on a counter. ddb/migration_offer_type.sql.
+    use_deallock = db.Column(db.Boolean, nullable=False, default=True)
     expires_at = db.Column(db.DateTime, nullable=False)
     responded_at = db.Column(db.DateTime)
     # Phase 3 stored here when the buyer ticked the deal warning on this
@@ -143,6 +149,7 @@ class DealOffer(db.Model):
             "status": OFFER_EXPIRED if (self.status == OFFER_OPEN and not self.is_live())
                       else self.status,
             "note": self.note,
+            "use_deallock": self.use_deallock is not False,
             "from_role": "seller" if self.from_user_id == self.seller_id else "buyer",
             "expires_at": iso_utc(self.expires_at),
             "responded_at": iso_utc(self.responded_at),

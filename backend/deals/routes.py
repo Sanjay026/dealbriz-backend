@@ -85,7 +85,7 @@ from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_vie
                       docs_all_approved, docs_checklist, docs_question_pending,
                       force_cancel, party_docs_uploaded, request_cancel, withdraw_cancel,
                       financer_name, has_chat_thread, inr,
-                      lender_financer_id, listing_blocked_reason,
+                      deallock_block_reason, lender_financer_id, listing_blocked_reason,
                       live_deal_for_product, loan_summary, lock_deal,
                       mark_paid, mark_ready_to_pay, new_handover_code, notify,
                       notify_doc_reviewers, notify_staff, own_block_reason,
@@ -178,13 +178,34 @@ def _offer_message_text(kind_label, price, note):
     return text
 
 
-def _new_offer(product, buyer_id, from_user, price, note, round_number, previous, acknowledged=False):
+def _wants_deallock(data, default):
+    """use_deallock from the request: True (DealLock, EMI) or False (a normal
+    offer). Missing means default, so an older page keeps sending DealLock
+    offers as before."""
+    raw = data.get("use_deallock", None)
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(raw)
+
+
+def _offer_label(use_deallock, counter=False):
+    """What the chat, the bell and the push call this offer, so the other
+    side sees at once which kind it is."""
+    kind = "counter-offer" if counter else "offer"
+    return f"DealLock (EMI) {kind}" if use_deallock else f"Normal {kind} (no EMI)"
+
+
+def _new_offer(product, buyer_id, from_user, price, note, round_number, previous, acknowledged=False,
+               use_deallock=True):
     now = utcnow()
     offer = DealOffer(
         product_id=product.id, buyer_id=buyer_id, seller_id=product.posted_by,
         from_user_id=from_user.id, previous_offer_id=previous.id if previous else None,
         price=price, round_number=round_number, status=OFFER_OPEN,
-        note=note or None, expires_at=now + timedelta(hours=rules.OFFER_HOURS),
+        note=note or None, use_deallock=bool(use_deallock),
+        expires_at=now + timedelta(hours=rules.OFFER_HOURS),
         acknowledged_at=now if acknowledged else None,
     )
     db.session.add(offer)
@@ -196,7 +217,7 @@ def _announce_offer(offer, product, from_user, label, outbox):
     to_id = offer.buyer_id if from_user.id == offer.seller_id else offer.seller_id
     text = _offer_message_text(label, offer.price, offer.note)
     post_thread_message(product.id, from_user.id, to_id, text, "offer", offer.id)
-    title = f"{label} from {display_name(from_user)}"
+    title = f"{label[0].upper()}{label[1:]} from {display_name(from_user)}"
     notify(to_id, title[:200], f"{inr(offer.price)} for {product.title}", product.id)
     outbox.push(to_id, f"{display_name(from_user)} · {product.title}",
                 f"{label}: {inr(offer.price)}", product.id, from_user.id)
@@ -223,10 +244,15 @@ def get_rules():
 def send_offer():
     """A new offer in a chat about a listing, from either side.
 
-    Seller: {product_id, buyer_id, price, note?}. The buyer must already have
-    messaged about the listing (offers never go to an arbitrary user id).
-    Buyer:  {product_id, price, note?}. The offer itself starts the chat if
-    there wasn't one.
+    Seller: {product_id, buyer_id, price, note?, use_deallock?}. The buyer
+    must already have messaged about the listing (offers never go to an
+    arbitrary user id).
+    Buyer:  {product_id, price, note?, use_deallock?}. The offer itself
+    starts the chat if there wasn't one.
+
+    use_deallock (default true): a DealLock offer, with EMI, that becomes a
+    locked deal when accepted. false: a normal offer, which only agrees the
+    price (see accept_offer).
 
     One live offer per buyer per listing (design). If the other side's offer
     is still open, this is refused: answer that one (accept, counter or
@@ -240,7 +266,9 @@ def send_offer():
     product = Product.query.filter_by(id=data.get("product_id")).with_for_update().first()
     if not product:
         return _err("That listing no longer exists.", 404)
-    reason = listing_blocked_reason(product)
+    use_deallock = _wants_deallock(data, True)
+    reason = listing_blocked_reason(product, deallock=use_deallock,
+                                    viewer_is_seller=product.posted_by == user.id)
     if reason:
         return _err(reason, 409)
     reason = own_block_reason(user)
@@ -288,8 +316,8 @@ def send_offer():
     db.session.flush()   # free the "one open offer" slot before inserting
 
     outbox = Outbox()
-    offer = _new_offer(product, buyer.id, user, price, note, 1, None)
-    _announce_offer(offer, product, user, "Offer", outbox)
+    offer = _new_offer(product, buyer.id, user, price, note, 1, None, use_deallock=use_deallock)
+    _announce_offer(offer, product, user, _offer_label(use_deallock), outbox)
 
     failed = _commit_or_conflict()
     if failed:
@@ -315,7 +343,8 @@ def get_offer(offer_id):
 @bp.route("/offers/<offer_id>/counter", methods=["POST"])
 @jwt_required()
 def counter_offer(offer_id):
-    """{price, note?}"""
+    """{price, note?, use_deallock?}. use_deallock defaults to the offer's
+    own kind; the side countering may switch between DealLock and normal."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
@@ -338,7 +367,8 @@ def counter_offer(offer_id):
                     "this offer, or send a fresh offer after declining.", 409)
 
     product = Product.query.filter_by(id=offer.product_id).with_for_update().first()
-    reason = listing_blocked_reason(product)
+    use_deallock = _wants_deallock(data, offer.use_deallock is not False)
+    reason = listing_blocked_reason(product, deallock=use_deallock, viewer_is_seller=not is_buyer)
     if reason:
         return _err(reason, 409)
     reason = own_block_reason(user)
@@ -364,8 +394,8 @@ def counter_offer(offer_id):
 
     outbox = Outbox()
     new = _new_offer(product, offer.buyer_id, user, price, note,
-                     offer.round_number + 1, offer)
-    _announce_offer(new, product, user, "Counter-offer", outbox)
+                     offer.round_number + 1, offer, use_deallock=use_deallock)
+    _announce_offer(new, product, user, _offer_label(use_deallock, counter=True), outbox)
 
     failed = _commit_or_conflict()
     if failed:
@@ -397,9 +427,10 @@ def accept_offer(offer_id):
     if offer.status != OFFER_OPEN:
         return _err(f"This offer is already {offer.status}.", 409)
     is_buyer = user.id == offer.buyer_id
+    use_deallock = offer.use_deallock is not False
 
     product = Product.query.filter_by(id=offer.product_id).with_for_update().first()
-    reason = listing_blocked_reason(product)
+    reason = listing_blocked_reason(product, deallock=use_deallock, viewer_is_seller=not is_buyer)
     if reason:
         return _err(reason, 409)
     if product.posted_by != offer.seller_id:
@@ -420,6 +451,8 @@ def accept_offer(offer_id):
     now = utcnow()
     offer.status = OFFER_ACCEPTED
     offer.responded_at = now
+    if not use_deallock:
+        return _accept_normal_offer(offer, product, user, is_buyer)
     confirm_by = now + timedelta(hours=rules.CONFIRM_HOURS)
     deal = Deal(
         accepted_offer_id=offer.id, product_id=product.id,
@@ -460,6 +493,28 @@ def accept_offer(offer_id):
         return failed
     outbox.send()
     return jsonify(deal.to_dict(viewer_id=user.id)), 201
+
+
+def _accept_normal_offer(offer, product, user, is_buyer):
+    """A normal offer (no EMI) was accepted: the price is agreed in the chat
+    and that's all. No deal is made, the listing isn't held or reserved,
+    and DealBriz takes no part in the payment or the handover. Answers
+    {offer, deal: null, use_deallock: false}."""
+    other_id = offer.from_user_id
+    who = "buyer" if is_buyer else "seller"
+    text = (f"Normal offer of {inr(offer.price)} accepted by the {who}. This is not a DealLock "
+            "deal: there is no EMI through DealBriz and the listing is not reserved. Agree the "
+            "payment and the handover between yourselves, and meet in a safe public place.")
+    post_thread_message(product.id, user.id, other_id, text, "system", offer.id)
+    outbox = Outbox()
+    title = f"Offer accepted by the {who}"
+    notify(other_id, f"{title} \u00b7 {product.title}"[:200], text, product.id)
+    outbox.push(other_id, f"{title} \u00b7 {product.title}", text, product.id, user.id)
+    failed = _commit_or_conflict()
+    if failed:
+        return failed
+    outbox.send()
+    return jsonify({"offer": offer.to_dict(viewer_id=user.id), "deal": None, "use_deallock": False}), 201
 
 
 def _close_offer(offer_id, new_status):
@@ -552,8 +607,11 @@ def get_thread():
 
     is_seller = user.id == seller_id
     other = User.query.get(other_id)
-    why_not = (listing_blocked_reason(product) or own_block_reason(user)
+    # Whether ANY offer can be sent (a normal one at least); a DealLock
+    # (EMI) offer also needs deallock_available.
+    why_not = (listing_blocked_reason(product, deallock=False) or own_block_reason(user)
                or party_block_reason(other, "buyer" if is_seller else "seller"))
+    deallock_why_not = deallock_block_reason(product, viewer_is_seller=is_seller)
     live = live_deal_for_product(product.id)
     if not why_not and live is not None and live.buyer_id != buyer_id:
         why_not = IN_A_DEAL
@@ -574,6 +632,8 @@ def get_thread():
         "listing_reserved_for_someone_else": bool(live is not None and live.buyer_id != buyer_id),
         "can_send_offer": can_send,
         "cannot_send_offer_reason": why_not,
+        "deallock_available": deallock_why_not is None,
+        "deallock_unavailable_reason": deallock_why_not,
         "my_deal_ban_until": user.to_dict()["deal_ban_until"],
         "rules": rules.public_rules(),
     })

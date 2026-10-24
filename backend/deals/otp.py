@@ -30,6 +30,11 @@ Settings (.env next to docker-compose.prod.yml):
 
 Rules: a code lasts 10 minutes and works once, 5 wrong tries kill it, a new
 code can be sent after 60 seconds, and at most 5 codes per hour per user.
+
+The same codes also go out by EMAIL (send_email_code), through mailer.py
+(MAIL_PROVIDER, the same mailbox as the lender emails): used for "Forgot
+password" (purpose password_reset, auth/routes.py). Same rules, and the
+hourly limit counts that purpose only.
 """
 import hashlib
 import hmac
@@ -54,6 +59,7 @@ RESEND_SECONDS = 60
 MAX_PER_HOUR = 5
 
 PURPOSE_DEAL_CONFIRM = "deal_confirm"
+PURPOSE_PASSWORD_RESET = "password_reset"   # emailed, see send_email_code
 PURPOSE_PASSWORD_FAIL = "deal_confirm_pw"     # one row per wrong password
 PASSWORD_MAX_FAILS = 5
 PASSWORD_BLOCK_MINUTES = 15
@@ -217,13 +223,78 @@ def send_code(user, purpose, ref_id, now):
             "resend_after_seconds": RESEND_SECONDS}
 
 
-def check_code(user, purpose, ref_id, code, now):
+def mask_email(email):
+    """ad****@gmail.com"""
+    local, _, domain = str(email or "").partition("@")
+    if not domain:
+        return "your email"
+    return f"{local[:2]}{'*' * max(2, len(local) - 2)}@{domain}"
+
+
+def send_email_code(user, purpose, now, subject, lead):
+    """Creates a code and emails it to the user's account email. The same
+    6-digit code, HMAC and limits as the SMS codes; the hourly limit counts
+    this purpose only. Returns {"sent_to", "expires_in_minutes",
+    "resend_after_seconds"}. The caller commits (and rolls back if this
+    raises). Raises OtpError."""
+    import mailer
+    if not mailer.is_configured():
+        raise OtpError("Email isn't set up on DealBriz right now, so a code can't be sent. "
+                       "Please contact support@dealbriz.com.", 503)
+    last = (OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=None)
+            .order_by(OtpCode.created_at.desc()).first())
+    if last and last.created_at and (now - last.created_at).total_seconds() < RESEND_SECONDS:
+        wait = RESEND_SECONDS - int((now - last.created_at).total_seconds())
+        raise OtpError(f"Please wait {wait} seconds before asking for a new code.", 429)
+    hour_ago = now - timedelta(hours=1)
+    recent = (OtpCode.query.filter(OtpCode.user_id == user.id, OtpCode.purpose == purpose,
+                                   OtpCode.created_at > hour_ago).count())
+    if recent >= MAX_PER_HOUR:
+        raise OtpError("Too many codes asked for. Please try again in an hour.", 429)
+
+    for old in OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=None,
+                                       consumed_at=None).all():
+        old.consumed_at = now
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    row = OtpCode(user_id=user.id, purpose=purpose, ref_id=None, code_hash="", sent_to="email",
+                  expires_at=now + timedelta(minutes=CODE_MINUTES), attempts=0, created_at=now)
+    db.session.add(row)
+    db.session.flush()
+    row.code_hash = _hash(row.id, code)
+
+    name = (user.first_name or "").strip() or "there"
+    text = (f"Hi {name},\n\n{lead}\n\nYour code: {code}\n\n"
+            f"It works for {CODE_MINUTES} minutes and only once. Never share it with anyone: "
+            "DealBriz will never ask you for it.\n\n"
+            "If you didn't ask for this, ignore this email. Nothing changes.\n\nDealBriz")
+    html = (f"<p>Hi {_esc(name)},</p><p>{_esc(lead)}</p>"
+            f"<p style=\"font-size:28px;font-weight:700;letter-spacing:6px;margin:18px 0\">{code}</p>"
+            f"<p>It works for {CODE_MINUTES} minutes and only once. Never share it with anyone: "
+            "DealBriz will never ask you for it.</p>"
+            "<p style=\"color:#666\">If you didn't ask for this, ignore this email. Nothing changes.</p>"
+            "<p>DealBriz</p>")
+    try:
+        mailer.send(mailer.build([user.email], subject, text, html))
+    except mailer.MailError as exc:
+        log.error("Code email failed (%s): %s", purpose, exc)
+        raise OtpError("We couldn't send the email just now. Please try again in a minute.", 502)
+    return {"sent_to": mask_email(user.email), "expires_in_minutes": CODE_MINUTES,
+            "resend_after_seconds": RESEND_SECONDS}
+
+
+def _esc(text):
+    import html as _html
+    return _html.escape(str(text or ""))
+
+
+def check_code(user, purpose, ref_id, code, now, where="SMS"):
     """True if right (and uses the code up). Raises OtpError when wrong,
     expired or used up. Wrong tries are counted, so the caller must commit
-    even when this raises."""
+    even when this raises. where: "SMS" or "email", for the messages."""
     code = "".join(ch for ch in str(code or "") if ch.isdigit())
     if len(code) != 6:
-        raise OtpError("Enter the 6-digit code from the SMS.", 400)
+        raise OtpError(f"Enter the 6-digit code from the {where}.", 400)
     row = (OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=ref_id, consumed_at=None)
            .order_by(OtpCode.created_at.desc()).with_for_update().first())
     if not row:
