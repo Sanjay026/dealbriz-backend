@@ -161,7 +161,10 @@ def _expire_if_lapsed(offer):
 
 def _confirm_words():
     """How the seller confirms, for message text."""
-    return "your account password" if otp.confirm_method() == "password" else "the SMS code"
+    method = otp.confirm_method()
+    if method == "password":
+        return "your account password"
+    return "the code sent to their email" if method == "email" else "the SMS code"
 
 
 def _acknowledged(data):
@@ -768,10 +771,20 @@ def confirm_send_code(deal_id):
     deal, problem = _seller_deal_for_confirm(deal_id, user)
     if problem:
         return problem
-    if otp.confirm_method() == "password":
+    method = otp.confirm_method()
+    if method == "password":
         return jsonify({"method": "password"})
     try:
-        info = otp.send_code(user, otp.PURPOSE_DEAL_CONFIRM, deal.id, utcnow())
+        if method == "email":
+            product = Product.query.get(deal.product_id)
+            title = product.title if product else "your listing"
+            info = otp.send_email_code(
+                user, otp.PURPOSE_DEAL_CONFIRM, utcnow(), "Your DealBriz code to confirm the deal",
+                f"Use this code to confirm the DealLock deal for {title} at {inr(deal.agreed_price)}.",
+                ref_id=deal.id)
+        else:
+            info = otp.send_code(user, otp.PURPOSE_DEAL_CONFIRM, deal.id, utcnow())
+        info["method"] = method
     except otp.OtpError as exc:
         db.session.rollback()
         return _err(exc.message, exc.code)
@@ -797,10 +810,12 @@ def confirm(deal_id):
     if problem:
         return problem
     try:
-        if otp.confirm_method() == "password":
+        method = otp.confirm_method()
+        if method == "password":
             otp.check_password(user, deal.id, data.get("password"), utcnow())
         else:
-            otp.check_code(user, otp.PURPOSE_DEAL_CONFIRM, deal.id, data.get("code"), utcnow())
+            otp.check_code(user, otp.PURPOSE_DEAL_CONFIRM, deal.id, data.get("code"), utcnow(),
+                           where="email" if method == "email" else "SMS")
     except otp.OtpError as exc:
         db.session.commit()   # keep the wrong-try count
         return _err(exc.message, exc.code)

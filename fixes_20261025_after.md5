@@ -1,0 +1,6 @@
+fa13cca7236b893cd494f5a9be2d682a  frontend/index.html
+7ff0995b4ac0eb4358cc24276cacbfb6  frontend/app.js
+046925cbcdd7c397174947804189a9e1  frontend/deals.js
+a8d6af1e070752742c4357e2dee191a7  backend/deals/otp.py
+80ce56ac8c61df5e84465cd9be56a6d2  backend/deals/routes.py
+d5be2dab952798ca24fc7c2099f7b954  backend/admin/routes.py

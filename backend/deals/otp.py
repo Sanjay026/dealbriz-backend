@@ -88,7 +88,15 @@ def is_configured():
 
 
 def confirm_method():
-    return "sms" if is_configured() else "password"
+    """How the seller confirms a deal: "sms" when an SMS provider is set up,
+    else "email" (a 6-digit code to the account email, when email is set
+    up, see send_email_code), else "password"."""
+    if is_configured():
+        return "sms"
+    import mailer
+    if mailer.is_configured():
+        return "email"
+    return "password"
 
 
 def check_password(user, ref_id, password, now):
@@ -231,7 +239,7 @@ def mask_email(email):
     return f"{local[:2]}{'*' * max(2, len(local) - 2)}@{domain}"
 
 
-def send_email_code(user, purpose, now, subject, lead):
+def send_email_code(user, purpose, now, subject, lead, ref_id=None):
     """Creates a code and emails it to the user's account email. The same
     6-digit code, HMAC and limits as the SMS codes; the hourly limit counts
     this purpose only. Returns {"sent_to", "expires_in_minutes",
@@ -241,7 +249,7 @@ def send_email_code(user, purpose, now, subject, lead):
     if not mailer.is_configured():
         raise OtpError("Email isn't set up on DealBriz right now, so a code can't be sent. "
                        "Please contact support@dealbriz.com.", 503)
-    last = (OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=None)
+    last = (OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=ref_id)
             .order_by(OtpCode.created_at.desc()).first())
     if last and last.created_at and (now - last.created_at).total_seconds() < RESEND_SECONDS:
         wait = RESEND_SECONDS - int((now - last.created_at).total_seconds())
@@ -252,12 +260,12 @@ def send_email_code(user, purpose, now, subject, lead):
     if recent >= MAX_PER_HOUR:
         raise OtpError("Too many codes asked for. Please try again in an hour.", 429)
 
-    for old in OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=None,
+    for old in OtpCode.query.filter_by(user_id=user.id, purpose=purpose, ref_id=ref_id,
                                        consumed_at=None).all():
         old.consumed_at = now
 
     code = f"{secrets.randbelow(1000000):06d}"
-    row = OtpCode(user_id=user.id, purpose=purpose, ref_id=None, code_hash="", sent_to="email",
+    row = OtpCode(user_id=user.id, purpose=purpose, ref_id=ref_id, code_hash="", sent_to="email",
                   expires_at=now + timedelta(minutes=CODE_MINUTES), attempts=0, created_at=now)
     db.session.add(row)
     db.session.flush()

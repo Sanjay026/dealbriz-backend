@@ -60,13 +60,40 @@ def admin_list_users():
     users = User.query.order_by(User.created_at.desc()).all()
     members = {m.user_id: m for m in FinancerMember.query.all()}
     financers = {f.financer_id: f for f in Financer.query.all()}
+    places = _pincode_places({(u.city or "").strip() for u in users})
     result = []
     for u in users:
         d = u.to_dict()
         d["roles"] = get_user_role_names(u.id)
         d["lender"] = _lender_info(u.id, members, financers)
+        d["place"] = _user_place(u, places)
         result.append(d)
     return jsonify(result)
+
+
+def _pincode_places(values):
+    """{pincode: "District, State"} from the pincodes table, for the 6-digit
+    values among users' city field (which holds the signup pincode)."""
+    pins = {v for v in values if v.isdigit() and len(v) == 6}
+    if not pins:
+        return {}
+    from models import Pincode
+    out = {}
+    for row in Pincode.query.filter(Pincode.pincode.in_(pins)).all():
+        if row.pincode not in out:
+            out[row.pincode] = ", ".join(x for x in (row.district, row.state) if x)
+    return out
+
+
+def _user_place(user, places):
+    """{"pincode", "city"} for the Users table. users.city holds a pincode
+    (sign-ups since pincodes were introduced) or, for older accounts, a city
+    name. The city for a pincode comes from the pincodes table; a pincode
+    is never guessed from a city name."""
+    raw = (user.city or "").strip()
+    if raw.isdigit() and len(raw) == 6:
+        return {"pincode": raw, "city": places.get(raw)}
+    return {"pincode": None, "city": raw or None}
 
 
 @bp.route("/users/<uid>", methods=["GET"])
