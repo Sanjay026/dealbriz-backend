@@ -407,7 +407,8 @@ def compose(row):
             ("Down payment", money(app.down_payment)),
             ("Loan amount requested", money(app.loan_amount)),
             ("Tenure", f"{app.tenure_months} months"),
-            ("Interest rate (buyer's estimate)", f"{float(app.interest_rate):g}% p.a."),
+            ("Interest rate (estimate)", f"{rules.LOAN_RATE_MIN}-{rules.LOAN_RATE_MAX}% p.a., "
+                                         f"EMI worked out at {float(app.interest_rate):g}%"),
             ("EMI (estimate)", money(app.monthly_emi)),
             ("Total repayable (estimate)", money(app.total_payable)),
         ]

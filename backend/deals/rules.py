@@ -68,6 +68,24 @@ DOC_RETENTION_DAYS = _int_env("DEALLOCK_DOC_RETENTION_DAYS", 30, 1, 3650)
 LOAN_VEHICLE = "vehicle"
 LOAN_PERSONAL = "personal"
 
+# The DealLock loan form: the rate is not chosen by the buyer. It is shown
+# as a range and the stored estimate (EMI, total) is worked out at the top
+# of it, LOAN_RATE_MAX. Tenure is one of LOAN_TENURES (12 months minimum).
+LOAN_RATE_MIN = 10
+LOAN_RATE_MAX = 16
+LOAN_TENURES = (12, 18, 24, 36, 48, 60)
+
+
+def emi_estimate(loan_amount, tenure_months, rate=LOAN_RATE_MAX):
+    """(monthly EMI, total payable), whole rupees."""
+    loan = float(loan_amount)
+    r = float(rate) / 12 / 100
+    n = int(tenure_months)
+    if loan <= 0:
+        return 0, 0
+    emi = loan * r * (1 + r) ** n / ((1 + r) ** n - 1) if r > 0 else loan / n
+    return round(emi), round(emi) * n
+
 # Every document a buyer or seller can be asked for. Order is the order shown.
 # Aadhaar and PAN are accepted as they are (a full Aadhaar card is fine,
 # 22 Oct 2026). The files are private: only superadmins and the lender open
@@ -138,6 +156,9 @@ def public_rules():
         "listing_docs": {"vehicle": list(VEHICLE_DOCS), "vehicle_loan_extra": [],
                          "other": list(PERSONAL_DOCS)},
         "buyer_docs": list(BUYER_DOCS),
+        "loan_rate_min": LOAN_RATE_MIN,
+        "loan_rate_max": LOAN_RATE_MAX,
+        "loan_tenures": list(LOAN_TENURES),
         "doc_max_mb": DOC_MAX_BYTES // (1024 * 1024),
         "doc_extensions": sorted(DOC_EXTENSIONS),
     }

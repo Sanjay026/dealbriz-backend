@@ -37,6 +37,10 @@ class User(db.Model):
     # deal sets it back to 0.
     consecutive_cancels = db.Column(db.Integer, nullable=False, default=0)
     deal_ban_until = db.Column(db.DateTime)
+    # Set when a superadmin imposes or changes the pause (Admin, Users,
+    # Restrictions); empty for the automatic one after force cancels.
+    # ddb/migration_user_restrictions.sql.
+    deal_ban_reason = db.Column(db.String(255))
 
     def to_dict(self):
         return {
@@ -53,5 +57,8 @@ class User(db.Model):
             "deal_ban_until": (iso_utc(self.deal_ban_until)
                                if self.deal_ban_until and self.deal_ban_until > datetime.utcnow()
                                else None),
+            "deal_ban_reason": (self.deal_ban_reason
+                                if self.deal_ban_until and self.deal_ban_until > datetime.utcnow()
+                                else None),
             "created_at": iso_utc(self.created_at)
         }

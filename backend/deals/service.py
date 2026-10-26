@@ -251,6 +251,9 @@ def is_banned(user, now=None):
 
 def ban_message(user):
     """What a banned user is told, wherever they hit the ban."""
+    if getattr(user, "deal_ban_reason", None):
+        return (f"DealBriz has paused new listings and new deals on your account until "
+                f"{short_date(user.deal_ban_until)}. Reason: {user.deal_ban_reason}")
     return (f"You force-cancelled {rules.CANCEL_LIMIT} deals in a row, so you can't post "
             f"new listings or make new deals until {short_date(user.deal_ban_until)}.")
 
@@ -423,6 +426,7 @@ def count_cancel(user_id, now, outbox, product_id=None):
     banned_until = None
     if count >= rules.CANCEL_LIMIT:
         user.deal_ban_until = now + timedelta(days=rules.BAN_DAYS)
+        user.deal_ban_reason = None
         user.consecutive_cancels = 0
         banned_until = user.deal_ban_until.isoformat() + "Z"
         for offer in (DealOffer.query

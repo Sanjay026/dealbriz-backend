@@ -90,7 +90,7 @@ from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_vie
                       mark_paid, mark_ready_to_pay, new_handover_code, notify,
                       notify_doc_reviewers, notify_staff, own_block_reason,
                       party_block_reason, post_thread_message, release_deal,
-                      short_date, utcnow, PRODUCT_RESERVED)
+                      short_date, utcnow, PRODUCT_RESERVED, linked_application, notify_lender)
 
 log = logging.getLogger("dealbridge.deals")
 
@@ -1566,8 +1566,52 @@ def _staff_deal(deal_id):
 
 
 # The lender of a deal is the one the BUYER chooses on the loan form
-# (POST /api/loans/apply). Staff no longer set it on the deal; staff who
-# review EMI applications can still correct it on the EMI application.
+# (POST /api/loans/apply). Staff (deals.manage) can change it at any point
+# while the deal is live (below).
+
+@bp.route("/staff/<deal_id>/financer", methods=["POST"])
+@require_capability("deals.manage")
+def staff_set_financer(deal_id):
+    """{financer_id}: change the deal's lender, at any point while the deal
+    is live. Its loan application moves with it, and once the loan has been
+    applied for, the new lender gets the documents email."""
+    from . import lender_email
+    from models import Financer
+    staff = current_user()
+    deal = _staff_deal(deal_id)
+    if not deal:
+        return _err("Deal not found.", 404)
+    if deal.status not in LIVE_DEAL_STATES:
+        return _err(f"This deal is {deal.status.replace('_', ' ')}; its lender can't be changed.", 409)
+    try:
+        fid = int(_body().get("financer_id"))
+    except (TypeError, ValueError):
+        return _err("Choose a lender.", 400)
+    f = Financer.query.get(fid)
+    if not f or (f.status or "active") != "active":
+        return _err("Choose an active lender.", 400)
+    if deal.loan_type not in f.loan_type_list():
+        return _err(f"{f.name} doesn't fund {deal.loan_type} loans.", 409)
+    if deal.financer_id == f.financer_id:
+        return _err(f"{f.name} is already this deal's lender.", 409)
+    old = financer_name(deal.financer_id)
+    deal.financer_id = f.financer_id
+    app = linked_application(deal)
+    if app is not None:
+        app.financer_id = f.financer_id
+    add_event(deal, "lender_set", staff.id, lender=f.name, previous=old)
+    mail_row = None
+    if app is not None and deal.status in (DEAL_LOAN_IN_PROGRESS, DEAL_READY_TO_PAY):
+        mail_row = lender_email.queue(deal, app, staff.id)
+        notify_lender(f.financer_id, "New loan application (lender changed)",
+                      f"DealBriz moved a {deal.loan_type} loan application to you.", deal.product_id)
+    failed = _commit_or_conflict()
+    if failed:
+        return failed
+    if mail_row is not None and mail_row.status == lender_email.PENDING:
+        lender_email.send_soon([mail_row.id])
+    return jsonify(deal.to_dict())
+
 
 
 @bp.route("/staff/<deal_id>/lender-email", methods=["POST"])

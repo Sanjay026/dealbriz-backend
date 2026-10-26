@@ -297,6 +297,85 @@ def lift_deal_ban(uid):
     return jsonify(d)
 
 
+@bp.route("/users/<uid>/restriction", methods=["POST"])
+@jwt_required()
+def set_restriction(uid):
+    """Superadmin only. A user's DealLock restriction (no new listings, no new
+    offers or deals), whether it came from 3 force cancels in a row or not.
+        {until: "<ISO date-time>", reason}   impose, shorten or extend it
+        {until: null}                        lift it now
+        {cancels: 0..2}                      (optional, with either) set the
+                                             force-cancels-in-a-row count
+    Open offers the user sent are withdrawn when a restriction starts. Their
+    deals already running carry on, as with the automatic one."""
+    from datetime import timedelta
+    from deals import rules
+    from deals.service import ban_message
+    from models import DealOffer
+    from models.deal import OFFER_OPEN, OFFER_WITHDRAWN
+    caller = current_user()
+    if not is_superadmin(caller):
+        return jsonify({"error": "Only a superadmin can change restrictions."}), 403
+    u = User.query.filter_by(id=uid).with_for_update().first()
+    if not u:
+        return jsonify({"error": "Not found"}), 404
+    if u.id == caller.id:
+        return jsonify({"error": "You can't restrict your own account."}), 400
+    data = request.get_json(silent=True) or {}
+    now = datetime.utcnow()
+    was_active = bool(u.deal_ban_until and u.deal_ban_until > now)
+
+    if "cancels" in data:
+        try:
+            cancels = int(data.get("cancels"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "The cancel count must be a number."}), 400
+        if not 0 <= cancels < rules.CANCEL_LIMIT:
+            return jsonify({"error": f"The cancel count must be 0 to {rules.CANCEL_LIMIT - 1}."}), 400
+        u.consecutive_cancels = cancels
+
+    if "until" in data:
+        raw = data.get("until")
+        if raw in (None, ""):
+            u.deal_ban_until = None
+            u.deal_ban_reason = None
+            if was_active:
+                Notification.push(u.id, "system", "You can post listings and make deals again",
+                                  body="DealBriz lifted the restriction on your account.")
+        else:
+            try:
+                until = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                return jsonify({"error": "That date isn't valid."}), 400
+            if until.tzinfo is not None:   # stored as naive UTC, like every other time
+                until = (until - until.utcoffset()).replace(tzinfo=None)
+            if until <= now + timedelta(minutes=5):
+                return jsonify({"error": "Choose a time in the future, or lift the restriction."}), 400
+            if until > now + timedelta(days=365):
+                return jsonify({"error": "A restriction can last at most 365 days."}), 400
+            reason = " ".join(str(data.get("reason") or "").split())[:255]
+            if not reason:
+                return jsonify({"error": "Add a reason. The user is shown it."}), 400
+            u.deal_ban_until = until
+            u.deal_ban_reason = reason
+            if not was_active:
+                for offer in (DealOffer.query.filter(DealOffer.status == OFFER_OPEN,
+                                                     DealOffer.from_user_id == u.id)
+                              .with_for_update().all()):
+                    offer.status = OFFER_WITHDRAWN
+                    offer.responded_at = now
+            Notification.push(u.id, "system",
+                              "Your restriction was changed" if was_active
+                              else "New listings and deals paused on your account",
+                              body=ban_message(u) + " Your current deals carry on. Contact support if "
+                                                    "you think this is a mistake.")
+    db.session.commit()
+    d = u.to_dict()
+    d["roles"] = get_user_role_names(u.id)
+    d["lender"] = _lender_info(u.id)
+    return jsonify(d)
+
+
 @bp.route("/products", methods=["GET"])
 @require_capability("products.view")
 def admin_list_products():

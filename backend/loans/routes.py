@@ -25,6 +25,7 @@ from models import Deal, EmiApplication, LoanStatusEvent, Product
 from models.deal import (DEAL_AWAITING_SELLER, DEAL_DOCS_PENDING,
                          DEAL_LOAN_IN_PROGRESS, DEAL_LOCKED, LOAN_VEHICLE)
 from utils import current_user
+from deals import rules
 from deals.service import (Outbox, add_event, add_loan_event, buyer_lender_choices,
                            financer_name,
                            lender_financer_id, notify, notify_lender,
@@ -119,10 +120,34 @@ def apply_for_loan():
             return _err(f"That EMI application is {app.status}. Please apply again.", 409)
         if float(app.loan_amount) > float(deal.agreed_price):
             return _err("That application's loan is more than the agreed price. Please apply again.", 409)
+        if int(app.tenure_months) < min(rules.LOAN_TENURES):
+            return _err(f"That application is for less than {min(rules.LOAN_TENURES)} months. "
+                        "Please apply again below.", 409)
+        # The rate is fixed now: the estimate is worked out again on it.
+        app.interest_rate = rules.LOAN_RATE_MAX
+        app.monthly_emi, app.total_payable = rules.emi_estimate(app.loan_amount, app.tenure_months)
         linked_existing = True
     else:
         from emi.routes import build_emi_application
+        # The buyer picks the down payment and the tenure only. The rate is
+        # fixed, and the loan and the estimate are worked out here, whatever
+        # the page sent.
+        try:
+            tenure = int(data.get("tenure_months"))
+            down = float(data.get("down_payment") or 0)
+        except (TypeError, ValueError):
+            return _err("Some amounts in the application are not valid numbers.", 400)
+        if tenure not in rules.LOAN_TENURES:
+            return _err(f"Choose a tenure of {min(rules.LOAN_TENURES)} months or more.", 400)
+        price = float(deal.agreed_price)
+        if down < 0 or down >= price:
+            return _err("The down payment must be less than the agreed price.", 400)
+        loan = round(price - down)
+        emi, total = rules.emi_estimate(loan, tenure)
         payload = dict(data)
+        payload.update({"tenure_months": tenure, "down_payment": down, "loan_amount": loan,
+                        "interest_rate": rules.LOAN_RATE_MAX, "monthly_emi": emi,
+                        "total_payable": total})
         payload["product_id"] = deal.product_id
         app, error = build_emi_application(user, payload, price_override=deal.agreed_price)
         if error:
