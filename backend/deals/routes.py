@@ -1566,23 +1566,28 @@ def _staff_deal(deal_id):
 
 
 # The lender of a deal is the one the BUYER chooses on the loan form
-# (POST /api/loans/apply). Staff (deals.manage) can change it at any point
-# while the deal is live (below).
+# (POST /api/loans/apply). Once the loan application has been emailed to
+# that lender, staff (deals.manage) can move it to another lender, e.g. when
+# the chosen one can't take it (below).
 
 @bp.route("/staff/<deal_id>/financer", methods=["POST"])
 @require_capability("deals.manage")
 def staff_set_financer(deal_id):
-    """{financer_id}: change the deal's lender, at any point while the deal
-    is live. Its loan application moves with it, and once the loan has been
-    applied for, the new lender gets the documents email."""
+    """{financer_id}: move the deal to another lender after the buyer applied
+    and the application was emailed to their chosen lender (Loan in progress
+    or Ready to pay). The loan application moves with it, and the new lender
+    gets the documents email."""
     from . import lender_email
     from models import Financer
     staff = current_user()
     deal = _staff_deal(deal_id)
     if not deal:
         return _err("Deal not found.", 404)
-    if deal.status not in LIVE_DEAL_STATES:
-        return _err(f"This deal is {deal.status.replace('_', ' ')}; its lender can't be changed.", 409)
+    if deal.status not in (DEAL_LOAN_IN_PROGRESS, DEAL_READY_TO_PAY):
+        return _err("The lender can be changed once the buyer has applied for the loan and it was "
+                    "sent to their chosen lender (Loan in progress or Ready to pay).", 409)
+    if not lender_email.summary(deal):
+        return _err("The loan application hasn't been sent to the buyer's chosen lender yet.", 409)
     try:
         fid = int(_body().get("financer_id"))
     except (TypeError, ValueError):

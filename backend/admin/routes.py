@@ -282,7 +282,10 @@ def suspend_user(uid):
 @require_capability("users.suspend")
 def lift_deal_ban(uid):
     """Ends a DealLock ban early (3 cancelled deals in a row) and sets the
-    count back to 0, e.g. when the cancels weren't the user's fault."""
+    count back to 0, e.g. when the cancels weren't the user's fault.
+    Superadmin only (see set_restriction for the full control)."""
+    if not is_superadmin(current_user()):
+        return jsonify({"error": "Only a superadmin can lift restrictions."}), 403
     u = User.query.get(uid)
     if not u:
         return jsonify({"error": "Not found"}), 404
@@ -307,7 +310,9 @@ def set_restriction(uid):
         {cancels: 0..2}                      (optional, with either) set the
                                              force-cancels-in-a-row count
     Open offers the user sent are withdrawn when a restriction starts. Their
-    deals already running carry on, as with the automatic one."""
+    deals already running carry on, as with the automatic one. A superadmin
+    may lift a restriction on their own account (and set its count), but
+    not impose one on it."""
     from datetime import timedelta
     from deals import rules
     from deals.service import ban_message
@@ -319,9 +324,9 @@ def set_restriction(uid):
     u = User.query.filter_by(id=uid).with_for_update().first()
     if not u:
         return jsonify({"error": "Not found"}), 404
-    if u.id == caller.id:
-        return jsonify({"error": "You can't restrict your own account."}), 400
     data = request.get_json(silent=True) or {}
+    if u.id == caller.id and data.get("until") not in (None, ""):
+        return jsonify({"error": "You can't restrict your own account. You can only lift it."}), 400
     now = datetime.utcnow()
     was_active = bool(u.deal_ban_until and u.deal_ban_until > now)
 

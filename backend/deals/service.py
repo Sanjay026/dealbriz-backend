@@ -249,13 +249,28 @@ def is_banned(user, now=None):
     return bool(user and user.deal_ban_until and user.deal_ban_until > now)
 
 
+def time_left_text(until, now=None):
+    """"2 days 4 hours", "5 hours 20 minutes", "12 minutes" until `until`."""
+    secs = max(0, int((until - (now or utcnow())).total_seconds()))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = max(1, rem // 60) if not (days or hours) else rem // 60
+    plural = lambda n, w: f"{n} {w}{'' if n == 1 else 's'}"  # noqa: E731
+    if days:
+        return plural(days, "day") + (f" {plural(hours, 'hour')}" if hours else "")
+    if hours:
+        return plural(hours, "hour") + (f" {plural(minutes, 'minute')}" if minutes else "")
+    return plural(minutes, "minute")
+
+
 def ban_message(user):
     """What a banned user is told, wherever they hit the ban."""
+    when = f"until {short_date(user.deal_ban_until)} ({time_left_text(user.deal_ban_until)} from now)"
     if getattr(user, "deal_ban_reason", None):
-        return (f"DealBriz has paused new listings and new deals on your account until "
-                f"{short_date(user.deal_ban_until)}. Reason: {user.deal_ban_reason}")
+        return (f"DealBriz has paused new listings and new deals on your account {when}. "
+                f"Reason: {user.deal_ban_reason}")
     return (f"You force-cancelled {rules.CANCEL_LIMIT} deals in a row, so you can't post "
-            f"new listings or make new deals until {short_date(user.deal_ban_until)}.")
+            f"new listings or make new deals {when}.")
 
 
 def own_block_reason(user):
