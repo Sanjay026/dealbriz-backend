@@ -1,0 +1,8 @@
+# Runtime: the web app (app.py) and CLI (pan_card_verification.py)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+# 1.4.x API (`from rapidocr_onnxruntime import RapidOCR`); the newer `rapidocr` package differs
+rapidocr_onnxruntime==1.4.4
+opencv-python>=4.8
+numpy

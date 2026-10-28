@@ -376,6 +376,12 @@ class DealDocument(db.Model):
     reviewed_by = db.Column(db.String(36), db.ForeignKey("users.id", ondelete="SET NULL"))
     reviewed_at = db.Column(db.DateTime)
     reject_reason = db.Column(db.String(255))
+    # Automatic OCR check on upload (deals/id_verify.py), for Aadhaar/PAN
+    # only. verified (approved without a person) / error (the model could
+    # not run). A wrong or unreadable card is refused at upload.
+    auto_check = db.Column(db.String(20))
+    auto_detail = db.Column(db.String(30))
+    auto_checked_at = db.Column(db.DateTime)
     deleted_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -392,6 +398,9 @@ class DealDocument(db.Model):
             "uploaded_at": iso_utc(self.uploaded_at),
             "reviewed_at": iso_utc(self.reviewed_at),
             "reject_reason": self.reject_reason,
+            "auto_check": self.auto_check,
+            "auto_detail": self.auto_detail,
+            "auto_checked_at": iso_utc(self.auto_checked_at),
             "file_deleted": self.deleted_at is not None,
         }
 

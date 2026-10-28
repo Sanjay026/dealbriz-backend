@@ -12,10 +12,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# curl is used by the container HEALTHCHECK below. Build tools are installed
-# and removed in the same layer so they don't ship in the final image.
+# curl is used by the container HEALTHCHECK below. libgl1 and libglib2.0-0
+# are what OpenCV (the Aadhaar/PAN OCR model) needs to import on a slim
+# image. Build tools are installed and removed in the same layer so they
+# don't ship in the final image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Requirements are copied on their own first: this layer is then cached and

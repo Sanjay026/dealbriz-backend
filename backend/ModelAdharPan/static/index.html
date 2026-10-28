@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aadhaar / PAN Verify</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --line: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --ok: #22c55e;
+    --bad: #ef4444;
+    --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: radial-gradient(1200px 600px at 50% -10%, #1e3a5f 0%, var(--bg) 55%);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .card {
+    width: 100%;
+    max-width: 560px;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 28px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, .45);
+  }
+  h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -.2px; }
+  .sub { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+  .drop {
+    display: grid;
+    place-items: center;
+    gap: 8px;
+    min-height: 170px;
+    padding: 20px;
+    border: 2px dashed var(--line);
+    border-radius: 12px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.dragover { border-color: var(--accent); background: rgba(56, 189, 248, .06); }
+  .drop strong { font-size: 15px; }
+  .drop span { color: var(--muted); font-size: 13px; }
+  .drop input { display: none; }
+  .preview {
+    display: none;
+    margin-top: 16px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+  }
+  .preview img { display: block; width: 100%; max-height: 300px; object-fit: contain; background: #000; }
+  .actions { display: flex; gap: 10px; margin-top: 18px; }
+  button {
+    flex: 1;
+    padding: 12px 16px;
+    border: 0;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s, transform .05s;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .primary { background: var(--accent); color: #06263a; }
+  .ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); flex: 0 0 auto; }
+  .result {
+    display: none;
+    margin-top: 18px;
+    padding: 16px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, .03);
+  }
+  .result.show { display: block; }
+  .verdict { display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 700; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  .meta { margin-top: 6px; color: var(--muted); font-size: 13px; }
+  .ok { color: var(--ok); } .ok .dot { background: var(--ok); }
+  .bad { color: var(--bad); } .bad .dot { background: var(--bad); }
+  .warn { color: var(--warn); } .warn .dot { background: var(--warn); }
+  .note { margin-top: 20px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .spinner {
+    width: 16px; height: 16px;
+    border: 2px solid rgba(0, 0, 0, .25);
+    border-top-color: #06263a;
+    border-radius: 50%;
+    display: inline-block;
+    vertical-align: -3px;
+    margin-right: 8px;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>Aadhaar / PAN Verify</h1>
+    <p class="sub">Upload one card image. The check runs on this machine.</p>
+
+    <form id="form" novalidate>
+      <label class="drop" id="drop" for="file">
+        <strong id="dropTitle">Click to choose an image</strong>
+        <span id="dropHint">or drag &amp; drop it here</span>
+        <span>JPG, PNG, WEBP or BMP &middot; up to 10 MB</span>
+        <input id="file" name="file" type="file" accept="image/jpeg,image/png,image/webp,image/bmp" />
+      </label>
+
+      <div class="preview" id="preview"><img id="previewImg" alt="Selected card preview" /></div>
+
+      <div class="actions">
+        <button type="submit" class="primary" id="submit" disabled>Verify card</button>
+        <button type="button" class="ghost" id="clear" hidden>Clear</button>
+      </div>
+    </form>
+
+    <section class="result" id="result" aria-live="polite">
+      <div class="verdict" id="verdict"><span class="dot"></span><span id="verdictText"></span></div>
+      <div class="meta" id="meta"></div>
+    </section>
+
+    <p class="note">
+      Only the verdict is returned to this page &mdash; no Aadhaar or PAN number is shown or stored.
+      This checks that the number is well-formed (Aadhaar Verhoeff checksum / PAN format);
+      it does not prove the card is genuine.
+    </p>
+  </main>
+
+<script>
+  const form = document.getElementById('form');
+  const input = document.getElementById('file');
+  const drop = document.getElementById('drop');
+  const dropTitle = document.getElementById('dropTitle');
+  const dropHint = document.getElementById('dropHint');
+  const preview = document.getElementById('preview');
+  const previewImg = document.getElementById('previewImg');
+  const submitBtn = document.getElementById('submit');
+  const clearBtn = document.getElementById('clear');
+  const result = document.getElementById('result');
+  const verdict = document.getElementById('verdict');
+  const verdictText = document.getElementById('verdictText');
+  const meta = document.getElementById('meta');
+
+  let selected = null;
+  let previewUrl = null;
+
+  function resetPreview() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+    preview.style.display = 'none';
+    previewImg.removeAttribute('src');
+  }
+
+  function choose(file) {
+    if (!file) return;
+    resetPreview();
+    selected = file;
+    previewUrl = URL.createObjectURL(file);
+    previewImg.src = previewUrl;
+    preview.style.display = 'block';
+    dropTitle.textContent = file.name;
+    dropHint.textContent = (file.size / 1024 / 1024).toFixed(2) + ' MB';
+    submitBtn.disabled = false;
+    clearBtn.hidden = false;
+    hideResult();
+  }
+
+  function clear() {
+    selected = null;
+    input.value = '';
+    resetPreview();
+    dropTitle.textContent = 'Click to choose an image';
+    dropHint.textContent = 'or drag & drop it here';
+    submitBtn.disabled = true;
+    clearBtn.hidden = true;
+    hideResult();
+  }
+
+  function hideResult() {
+    result.classList.remove('show');
+    verdict.className = 'verdict';
+    verdictText.textContent = '';
+    meta.textContent = '';
+  }
+
+  function showResult(kind, text, detail) {
+    result.classList.add('show');
+    verdict.className = 'verdict ' + kind;
+    verdictText.textContent = text;
+    meta.textContent = detail || '';
+  }
+
+  function setBusy(busy) {
+    submitBtn.disabled = busy || !selected;
+    submitBtn.innerHTML = busy ? '<span class="spinner"></span>Checking…' : 'Verify card';
+    clearBtn.disabled = busy;
+  }
+
+  input.addEventListener('change', () => choose(input.files[0]));
+
+  drop.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    drop.classList.add('dragover');
+  });
+  drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    drop.classList.remove('dragover');
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) choose(file);
+  });
+
+  clearBtn.addEventListener('click', clear);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!selected) return;
+
+    setBusy(true);
+    hideResult();
+
+    const body = new FormData();
+    body.append('file', selected);
+
+    try {
+      const res = await fetch('/verify', { method: 'POST', body });
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+
+      if (!res.ok) {
+        showResult('bad', 'Could not verify', data.detail || ('Request failed (' + res.status + ')'));
+        return;
+      }
+
+      const seconds = data.seconds != null ? data.seconds + ' s' : '';
+      if (data.status === 'INVALID') {
+        showResult('bad', 'INVALID', 'The number could not be validated. ' + seconds);
+      } else {
+        showResult('ok', data.status || 'VERIFIED', 'Verification passed. ' + seconds);
+      }
+    } catch (err) {
+      showResult('warn', 'Network error', 'The server did not respond. Is it running?');
+    } finally {
+      setBusy(false);
+    }
+  });
+</script>
+</body>
+</html>

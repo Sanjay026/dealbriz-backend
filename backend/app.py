@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import timedelta
 
 from flask import Flask, jsonify, redirect, request, send_from_directory
@@ -162,6 +163,14 @@ def create_app():
         return redirect(f"https://{primary}{request.full_path.rstrip('?')}", code=301)
 
     register_error_handlers(app)
+
+    # The Aadhaar/PAN OCR model takes tens of seconds to load, so warm it in
+    # the background instead of making the first upload wait. A failure only
+    # means uploads record auto_check="error"; the app itself is unaffected.
+    from deals import id_verify
+    if id_verify.enabled():
+        threading.Thread(target=id_verify.warm, name="id-verify-warmup", daemon=True).start()
+
     return app
 
 

@@ -79,7 +79,7 @@ from models.deal import (CONFIRMED_STATES, DEAL_AWAITING_SELLER, DEAL_DISPUTED,
 from utils import is_superadmin
 from permissions import has_capability, require_capability
 from utils import current_user, has_staff_access
-from . import doc_storage, listing_docs, otp, rules
+from . import doc_storage, id_verify, listing_docs, otp, rules
 from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_view_deal,
                       clean_utr, complete_deal, confirm_deal, display_name,
                       docs_all_approved, docs_checklist, docs_question_pending,
@@ -90,7 +90,8 @@ from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_vie
                       mark_paid, mark_ready_to_pay, new_handover_code, notify,
                       notify_doc_reviewers, notify_staff, own_block_reason,
                       party_block_reason, post_thread_message, release_deal,
-                      short_date, utcnow, PRODUCT_RESERVED, linked_application, notify_lender)
+                      short_date, utcnow, PRODUCT_RESERVED, linked_application, notify_lender,
+                      buyer_docs_approved)
 
 log = logging.getLogger("dealbridge.deals")
 
@@ -1129,8 +1130,8 @@ def documents_loan_answer(deal_id):
 @jwt_required()
 def upload_document(deal_id, doc_type):
     """Multipart form with "file" (JPG, PNG, WEBP or PDF, up to 8 MB).
-    Uploading again replaces the earlier file of that type, unless it was
-    already approved."""
+    Uploading again replaces the earlier file of that type, even an
+    approved one (until the deal locks), and is checked again."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
@@ -1155,9 +1156,49 @@ def upload_document(deal_id, doc_type):
     if problem:
         return _err(problem, 400)
 
+    # Automatic check of the buyer's identity documents (PAN / Aadhaar).
+    # Anything but a readable, valid card of the right kind is refused here,
+    # so the buyer fixes it now; "verified" approves the document (below).
+    # Only if the model cannot run does a file wait for a superadmin or the
+    # lender, recorded as "error" so they know it wasn't checked.
+    auto = None
+    if id_verify.checks(doc_type) and id_verify.enabled():
+        try:
+            file.stream.seek(0)
+            auto = id_verify.check_upload(file.stream.read(size), ext, doc_type)
+        except Exception:
+            log.exception("Document auto-check could not run for deal %s", deal.id)
+            auto = {"status": "error", "detail": None}
+        finally:
+            file.stream.seek(0)
+        if id_verify.refused(auto):
+            message = id_verify.refuse_message(doc_type, auto)
+            # A card replaced by one that fails is taken out too (its file
+            # deleted), so the row shows what was wrong, like a reviewer's
+            # rejection, instead of still saying verified.
+            old = DealDocument.query.filter_by(deal_id=deal.id, doc_type=doc_type).with_for_update().first()
+            if old is not None:
+                old_key = old.storage_key
+                now = utcnow()
+                old.status = DOC_REJECTED
+                old.storage_key = None
+                old.deleted_at = old.deleted_at or now
+                old.reviewed_by = None
+                old.reviewed_at = now
+                old.reject_reason = message[:255]
+                old.auto_check = auto["status"]
+                old.auto_detail = auto["detail"]
+                old.auto_checked_at = now
+                add_event(deal, "document_rejected", None, doc_type=doc_type,
+                          reason=old.reject_reason, by="model")
+                failed = _commit_or_conflict()
+                if failed:
+                    return failed
+                if old_key:
+                    doc_storage.delete(old_key)
+            return _err(message, 422)
+
     doc = DealDocument.query.filter_by(deal_id=deal.id, doc_type=doc_type).with_for_update().first()
-    if doc is not None and doc.status == DOC_APPROVED:
-        return _err("This document is already approved.", 409)
 
     try:
         key = doc_storage.save(file, deal.id, doc_type, ext, content_type)
@@ -1183,12 +1224,25 @@ def upload_document(deal_id, doc_type):
     doc.reviewed_at = None
     doc.reject_reason = None
     doc.deleted_at = None
+    doc.auto_check = auto.get("status") if auto else None
+    doc.auto_detail = auto.get("detail") if auto else None
+    doc.auto_checked_at = now if auto else None
     add_event(deal, "document_uploaded", user.id, doc_type=doc_type)
 
+    # The model read the right card with a valid number: approve it now.
+    # reviewed_by stays empty, so the record shows no person approved it.
+    auto_approved = bool(auto and auto.get("status") == "verified" and id_verify.auto_approve())
+    if auto_approved:
+        doc.status = DOC_APPROVED
+        doc.reviewed_at = now
+        add_event(deal, "document_approved", None, doc_type=doc_type, by="model")
+
     # Tell reviewers once one side has everything in, not on every file,
-    # and tell the other side (who may be waiting on it).
+    # and tell the other side (who may be waiting on it). Reviewers aren't
+    # told when the model already approved all of the buyer's documents.
     db.session.flush()
-    if party_docs_uploaded(deal, party):
+    outbox = Outbox()
+    if party_docs_uploaded(deal, party) and not (party == "buyer" and buyer_docs_approved(deal)):
         product = Product.query.get(deal.product_id)
         name = product.title if product else "deal"
         notify_doc_reviewers(deal, f"Documents to check \u00b7 {name}",
@@ -1198,6 +1252,8 @@ def upload_document(deal_id, doc_type):
         notify(other, f"The {party} uploaded their documents \u00b7 {name}"[:200],
                f"The {party} has uploaded their documents. They're checked by DealBriz or the "
                "lender. The deal locks once everything is verified.", deal.product_id)
+    if auto_approved and docs_all_approved(deal):
+        lock_deal(deal, user.id, outbox)
     try:
         db.session.commit()
     except IntegrityError:
@@ -1206,6 +1262,7 @@ def upload_document(deal_id, doc_type):
         return _err(RACE_MESSAGE, 409)
     if old_key and old_key != key:
         doc_storage.delete(old_key)
+    outbox.send()
     return jsonify(deal_detail(deal, user)), 201
 
 
