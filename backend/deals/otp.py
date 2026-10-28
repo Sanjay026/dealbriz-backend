@@ -296,7 +296,14 @@ def _esc(text):
     return _html.escape(str(text or ""))
 
 
-def check_code(user, purpose, ref_id, code, now, where="SMS"):
+def peek_code(user, purpose, ref_id, code, now, where="SMS"):
+    """Like check_code, but a right code stays usable: for "is this code
+    right?" before the real step (password reset). Wrong tries count the
+    same, so it can't be used to guess codes. The caller commits."""
+    return check_code(user, purpose, ref_id, code, now, where, consume=False)
+
+
+def check_code(user, purpose, ref_id, code, now, where="SMS", consume=True):
     """True if right (and uses the code up). Raises OtpError when wrong,
     expired or used up. Wrong tries are counted, so the caller must commit
     even when this raises. where: "SMS" or "email", for the messages."""
@@ -320,5 +327,6 @@ def check_code(user, purpose, ref_id, code, now, where="SMS"):
             row.consumed_at = now
             raise OtpError("Wrong code. That was the last try, so ask for a new code.", 400)
         raise OtpError(f"Wrong code. {left} {'try' if left == 1 else 'tries'} left.", 400)
-    row.consumed_at = now
+    if consume:
+        row.consumed_at = now
     return True

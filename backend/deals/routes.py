@@ -91,7 +91,7 @@ from .service import (Outbox, add_event, answer_cancel, can_review_docs, can_vie
                       notify_doc_reviewers, notify_staff, own_block_reason,
                       party_block_reason, post_thread_message, release_deal,
                       short_date, utcnow, PRODUCT_RESERVED, linked_application, notify_lender,
-                      buyer_docs_approved)
+                      buyer_docs_approved, is_doc_staff)
 
 log = logging.getLogger("dealbridge.deals")
 
@@ -1269,8 +1269,8 @@ def upload_document(deal_id, doc_type):
 @bp.route("/<deal_id>/documents/<doc_id>/file", methods=["GET"])
 @jwt_required()
 def view_document(deal_id, doc_id):
-    """A superadmin or the deal's own lender, nobody else (not other staff,
-    not the buyer or seller). These are identity documents."""
+    """DealBriz admins/superadmins or the deal's own lender, nobody else (not
+    other staff roles, not the buyer or seller). These are identity documents."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
@@ -1335,7 +1335,7 @@ def review_document(deal_id, doc_id):
         rejected_key = doc.storage_key
         doc.storage_key = None
         doc.deleted_at = now
-    by = "staff" if is_superadmin(user) else "lender"
+    by = "staff" if is_doc_staff(user) else "lender"
     add_event(deal, "document_" + ("approved" if decision == "approve" else "rejected"),
               user.id, doc_type=doc.doc_type, reason=doc.reject_reason, by=by)
 

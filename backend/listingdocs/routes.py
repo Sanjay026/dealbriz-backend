@@ -22,7 +22,8 @@ from sqlalchemy.exc import IntegrityError
 from extensions import db
 from models import ListingDocument, Product, User
 from models.deal import DOC_APPROVED, DOC_REJECTED, DOC_UPLOADED
-from utils import current_user, is_superadmin
+from utils import current_user, is_superadmin  # noqa: F401
+from deals.service import is_doc_staff
 from deals import doc_storage, listing_docs as ld, rules
 from deals.service import Outbox, display_name, lender_financer_id, utcnow
 
@@ -72,10 +73,10 @@ def queue():
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
-    superadmin = is_superadmin(user)
+    superadmin = is_doc_staff(user)   # superadmin or admin
     fid = None if superadmin else lender_financer_id(user)
     if not superadmin and fid is None:
-        return _err("Only a superadmin or a lender can check listing documents.", 403)
+        return _err("Only DealBriz admins or a lender can check listing documents.", 403)
     want = (request.args.get("state") or "checking").lower()
     if want not in ("checking", "needed", "verified", "all"):
         return _err("state must be checking, needed, verified or all.", 400)
@@ -310,7 +311,7 @@ def review(pid, doc_id):
 
     before = ld.state(product)
     now = utcnow()
-    superadmin = is_superadmin(user)
+    superadmin = is_doc_staff(user)   # superadmin or admin: checked by DealBriz
     doc.status = DOC_APPROVED if decision == "approve" else DOC_REJECTED
     doc.reviewed_by = user.id
     doc.reviewed_at = now

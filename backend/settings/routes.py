@@ -9,7 +9,7 @@ from utils import current_user, is_superadmin
 bp = Blueprint("settings", __name__, url_prefix="/api/settings")
 
 # Flags a superadmin may toggle from the admin panel.
-EDITABLE_SETTINGS = {"emi_enabled"}
+EDITABLE_SETTINGS = {"emi_enabled", "emi_status_enabled"}
 
 
 @bp.route("", methods=["GET"])

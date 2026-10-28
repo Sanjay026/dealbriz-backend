@@ -199,15 +199,25 @@ def lender_may_check(fid, deal):
     return any(f.financer_id == fid for f in active_financers_for(deal.loan_type))
 
 
-def can_review_docs(user, deal):
-    """Who may open and verify the buyer's and seller's documents: a
-    superadmin, or a lender (NBFC) in its portal (see lender_may_check).
-    Nobody else, not other staff roles, and not the buyer or seller
-    themselves once uploaded (they see each file's status, never the file)."""
+def is_doc_staff(user):
+    """DealBriz staff who check documents: superadmins and admins (anyone
+    with deals.manage). Managers and developers don't."""
     if not user:
         return False
     from utils import is_superadmin
-    if is_superadmin(user):
+    from permissions import has_capability
+    return is_superadmin(user) or has_capability(user, "deals.manage")
+
+
+def can_review_docs(user, deal):
+    """Who may open and verify the buyer's and seller's documents: DealBriz
+    staff who check documents (is_doc_staff), or a lender (NBFC) in its
+    portal (see lender_may_check). Nobody else, not other staff roles, and
+    not the buyer or seller themselves once uploaded (they see each file's
+    status, never the file)."""
+    if not user:
+        return False
+    if is_doc_staff(user):
         return True
     return lender_may_check(lender_financer_id(user), deal)
 
@@ -833,13 +843,13 @@ def confirm_deal(deal, seller, outbox):
 
 
 def notify_doc_reviewers(deal, title, body):
-    """The people who may check documents: superadmins, plus the deal's
-    lender's people, or, while no lender is set, the people of every active
-    lender funding that kind of loan (see lender_may_check)."""
-    from utils import is_superadmin
+    """The people who may check documents: DealBriz staff who check them
+    (is_doc_staff: superadmins and admins), plus the deal's lender's people,
+    or, while no lender is set, the people of every active lender funding
+    that kind of loan (see lender_may_check)."""
     for uid in staff_user_ids("deals.view"):
         u = User.query.get(uid)
-        if u is not None and is_superadmin(u):
+        if u is not None and is_doc_staff(u):
             Notification.push(uid, "system", title[:200], body=body,
                               link_page="admin", link_ref=deal.product_id)
     if deal.financer_id:

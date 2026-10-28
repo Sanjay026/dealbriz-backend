@@ -106,11 +106,12 @@ def create_app():
     from loans.routes import bp as loans_bp
     from lender.routes import bp as lender_bp
     from listingdocs.routes import bp as listing_docs_bp
+    from seo.routes import bp as seo_bp
 
     for blueprint in (
         auth_bp, buy_bp, sell_bp, mylistings_bp, profile_bp,
         saved_bp, chat_bp, emi_bp, financers_bp, admin_bp, reports_bp, legal_bp, faqs_bp, blog_bp, settings_bp, logs_bp, locations_bp, chatbot_bp, notifications_bp, deals_bp, loans_bp, lender_bp,
-        listing_docs_bp
+        listing_docs_bp, seo_bp
     ):
         app.register_blueprint(blueprint)
 

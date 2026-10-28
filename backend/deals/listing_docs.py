@@ -169,12 +169,13 @@ def lender_funds(fid, loan_type):
 
 
 def can_review(user, product):
-    """A superadmin, or the people of a lender that funds this kind of loan
-    (or that is the lender on a live deal for this listing)."""
+    """DealBriz staff who check documents (superadmin, admin), or the people
+    of a lender that funds this kind of loan (or that is the lender on a
+    live deal for this listing)."""
     if not user or not product:
         return False
-    from utils import is_superadmin
-    if is_superadmin(user):
+    from .service import is_doc_staff
+    if is_doc_staff(user):
         return True
     fid = _lender_fid(user)
     if fid is None:
@@ -215,14 +216,13 @@ def view(product, user):
 # --------------------------------------------------------------------------
 
 def reviewer_ids(product):
-    """Superadmins, plus the people of every active lender that funds this
-    kind of loan."""
-    from utils import is_superadmin
-    from .service import lender_member_ids, staff_user_ids
+    """DealBriz staff who check documents (superadmins and admins), plus the
+    people of every active lender that funds this kind of loan."""
+    from .service import is_doc_staff, lender_member_ids, staff_user_ids
     ids = []
     for uid in staff_user_ids("deals.view"):
         u = User.query.get(uid)
-        if u is not None and is_superadmin(u):
+        if u is not None and is_doc_staff(u):
             ids.append(uid)
     lt = loan_type_of(product)
     for f in Financer.query.filter_by(status="active").all():

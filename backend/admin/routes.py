@@ -130,7 +130,15 @@ def admin_update_user(uid):
         new_role_name = data["role_name"]
         role = Role.query.filter_by(role_name=new_role_name).first()
         if not role:
-            return jsonify({"error": "Invalid role name"}), 400
+            # A role the code knows (permissions.ROLE_CAPABILITIES) but whose
+            # row was never added (e.g. migration_dev_role.sql not run): add
+            # it now instead of refusing. Unknown names are still refused.
+            from permissions import ROLE_CAPABILITIES
+            if new_role_name not in ROLE_CAPABILITIES:
+                return jsonify({"error": "Invalid role name"}), 400
+            role = Role(role_name=new_role_name)
+            db.session.add(role)
+            db.session.flush()
 
         # A lender user works for one lender: that is what keeps each
         # lender's people to their own loans. The superadmin either sets it

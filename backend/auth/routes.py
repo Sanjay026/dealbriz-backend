@@ -247,6 +247,29 @@ def forgot_password():
     return jsonify(out)
 
 
+@bp.route("/verify-reset-code", methods=["POST"])
+def verify_reset_code():
+    """{email, code}: is this password-reset code right? Checked as soon as
+    the user enters it; the code stays valid for /reset-password. Wrong
+    tries count towards the same 5-try limit."""
+    from deals import otp
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
+    user = User.query.filter_by(email=email).first() if re.fullmatch(EMAIL_RE, email) else None
+    if not user or (user.account_status or "active") == "suspended":
+        return jsonify({"error": RESET_BAD_CODE}), 400
+    try:
+        otp.peek_code(user, otp.PURPOSE_PASSWORD_RESET, None, data.get("code"),
+                      datetime.utcnow(), where="email")
+    except otp.OtpError as exc:
+        db.session.commit()   # keep the wrong-try count
+        if exc.message == "Ask for a code first.":
+            return jsonify({"error": RESET_BAD_CODE}), 400
+        return jsonify({"error": exc.message}), exc.code
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 @bp.route("/reset-password", methods=["POST"])
 def reset_password():
     from deals import otp

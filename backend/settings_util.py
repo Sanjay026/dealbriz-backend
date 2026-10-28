@@ -13,6 +13,9 @@ DEFAULT_SETTINGS = {
     # Safe default: EMI stays OFF until a financing partner is signed and
     # someone explicitly switches it on.
     "emi_enabled": "false",
+    # The buyer's "EMI Status" page and its menu link. On by default, so
+    # nothing changes until a superadmin turns it off (Site Settings).
+    "emi_status_enabled": "true",
 }
 
 
@@ -39,4 +42,5 @@ def all_public_settings():
     """Flags the frontend is allowed to read without authentication.
     Whitelisted rather than dumping the table, so an internal-only flag
     added later isn't exposed by accident."""
-    return {"emi_enabled": emi_enabled()}
+    return {"emi_enabled": emi_enabled(),
+            "emi_status_enabled": get_bool_setting("emi_status_enabled")}
