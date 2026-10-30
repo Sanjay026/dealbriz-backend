@@ -45,6 +45,10 @@ class User(db.Model):
     # row, and sign-in refused until this time after LOGIN_MAX_FAILS of them.
     failed_logins = db.Column(db.Integer, nullable=False, default=0)
     login_locked_until = db.Column(db.DateTime)
+    # Google sign-in (ddb/migration_google_login.sql): Google's permanent id
+    # for this person ("sub" in the ID token). Set on the first Google
+    # sign-in; the email can change at Google, this never does.
+    google_sub = db.Column(db.String(255), unique=True)
 
     def to_dict(self):
         return {

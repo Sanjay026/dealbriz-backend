@@ -359,3 +359,96 @@ def change_password():
     # may be how someone else got in). This device stays signed in.
     revoke_all_sessions(user.id, keep_jti=get_jwt().get("sid"))
     return jsonify({"message": "Password updated"})
+
+
+# ===================== GOOGLE SIGN-IN =====================
+# auth/google.py checks the token. Here: which account it opens.
+#   1. An account already linked to this Google id: sign in.
+#   2. Else an account with the same (Google-verified) email: link it, then
+#      sign in. All its other sessions are ended when it is first linked.
+#   3. Else a new account from the Google profile. Phone and pincode are
+#      asked for afterwards (needs_profile), as Google doesn't give them.
+
+@bp.route("/google/config", methods=["GET"])
+def google_config():
+    """Public: the Web client id the page needs to show Google's button
+    (a client id is public by design; the secret is never sent or needed)."""
+    from auth.google import web_client_id
+    cid = web_client_id()
+    return jsonify({"enabled": bool(cid), "client_id": cid or None})
+
+
+@bp.route("/google", methods=["POST"])
+def google_sign_in():
+    """{credential}: the ID token from Google's button (or the app's Google
+    sign-in). Answers like /login (session cookies + {user, authenticated}),
+    plus created (a new account) and needs_profile (no phone or pincode)."""
+    import json
+    import secrets
+    from auth.google import GoogleTokenError, verify_id_token
+    from validation import NAME_MAX, _ANGLE
+    data = request.get_json(silent=True) or {}
+    try:
+        claims = verify_id_token(data.get("credential"))
+    except GoogleTokenError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    sub = str(claims["sub"])[:255]
+    email = str(claims["email"]).strip().lower()
+    if len(email) > 150 or not re.fullmatch(EMAIL_RE, email):
+        return jsonify({"error": "That Google account's email can't be used here."}), 400
+
+    created = False
+    linked = False
+    user = User.query.filter_by(google_sub=sub).first()
+    if user is None:
+        user = User.query.filter_by(email=email).first()
+        if user is not None:
+            if user.google_sub and user.google_sub != sub:
+                return jsonify({"error": "This email is linked to a different Google account."}), 409
+            user.google_sub = sub
+            linked = True
+        else:
+            def clean(v, fallback=""):
+                v = _ANGLE.sub("", str(v or "")).strip()[:NAME_MAX]
+                return v or fallback
+            user = User(
+                email=email,
+                # Never usable: a Google account has no DealBriz password
+                # until its owner sets one with "Forgot password".
+                password_hash=generate_password_hash(secrets.token_urlsafe(32)),
+                first_name=clean(claims.get("given_name"), clean(email.split("@")[0], "DealBriz")),
+                last_name=clean(claims.get("family_name")),
+                google_sub=sub,
+            )
+            db.session.add(user)
+            created = True
+
+    if (user.account_status or "active") == "suspended":
+        db.session.rollback()
+        return jsonify({
+            "error": "This account has been suspended. "
+                     "Contact DealBriz support if you believe this is a mistake."
+        }), 403
+    # Google has just proved who this is, so a password lock doesn't apply.
+    user.failed_logins = 0
+    user.login_locked_until = None
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"error": "Google sign-in failed. Please try again."}), 409
+    if linked:
+        # First Google sign-in on an existing account: end every other
+        # session on it, in case someone else was signed in to it.
+        revoke_all_sessions(user.id)
+
+    resp = issue_session(user)
+    body = resp.get_json()
+    body["created"] = created
+    body["needs_profile"] = not (user.phone and user.city)
+    resp.set_data(json.dumps(body))
+    if created:
+        resp.status_code = 201
+    return resp
+
