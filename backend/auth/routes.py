@@ -19,12 +19,15 @@ bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 @bp.route("/signup", methods=["POST"])
 def signup():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     required = ["email", "password", "first_name", "last_name", "phone", "city"]
     if not all(data.get(f) for f in required):
         return jsonify({"error": "Missing required fields"}), 400
+    data["password"] = str(data["password"])
     if len(data["password"]) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if len(data["password"]) > 128:
+        return jsonify({"error": "Password must be at most 128 characters"}), 400
 
     # Validate the email shape. Beyond correctness, an unvalidated email is
     # attacker-controlled text that later gets rendered in the admin users
@@ -50,6 +53,15 @@ def signup():
             or phone_digits[0] not in "6789"
             or phone_digits == phone_digits[0] * 10):
         return jsonify({"error": "Please enter a valid 10-digit mobile number"}), 400
+    # The digit check above ignored everything that wasn't a digit, so
+    # "98765<b>43210" passed and was stored as typed. validation.py also
+    # checks the characters, and the city/pincode (which went in unchecked).
+    from validation import Invalid, phone as valid_phone, user_city
+    try:
+        data["phone"] = valid_phone(data["phone"])
+        data["city"] = user_city(data["city"])
+    except Invalid as exc:
+        return jsonify({"error": exc.message}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
@@ -67,12 +79,39 @@ def signup():
     return resp
 
 
+LOGIN_MAX_FAILS = 10
+LOGIN_LOCK_MINUTES = 15
+
+
 @bp.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
-    user = User.query.filter_by(email=data.get("email", "").lower()).first()
-    if not user or not check_password_hash(user.password_hash, data.get("password", "")):
+    data = request.get_json(silent=True) or {}
+    user = User.query.filter_by(email=str(data.get("email") or "").strip().lower()).first()
+    password = str(data.get("password") or "")
+    now = datetime.utcnow()
+    # Lockout: LOGIN_MAX_FAILS wrong passwords in a row pause sign-in for
+    # LOGIN_LOCK_MINUTES. nginx limits each IP as well; this covers guesses
+    # spread over many IPs. Resetting the password lifts it.
+    if user and user.login_locked_until and user.login_locked_until > now:
+        mins = max(1, int((user.login_locked_until - now).total_seconds() // 60) + 1)
+        return jsonify({"error": f"Too many wrong passwords. Try again in {mins} minutes, "
+                                 "or reset your password."}), 429
+    if not user or not check_password_hash(user.password_hash, password):
+        if user:
+            # In SQL, so two workers counting at once can't lose a try.
+            User.query.filter_by(id=user.id).update(
+                {User.failed_logins: User.failed_logins + 1}, synchronize_session=False)
+            db.session.commit()
+            db.session.refresh(user)
+            if (user.failed_logins or 0) >= LOGIN_MAX_FAILS:
+                user.login_locked_until = now + timedelta(minutes=LOGIN_LOCK_MINUTES)
+                user.failed_logins = 0
+                db.session.commit()
         return jsonify({"error": "Invalid email or password"}), 401
+    if user.failed_logins or user.login_locked_until:
+        user.failed_logins = 0
+        user.login_locked_until = None
+        db.session.commit()
     # A suspended account keeps all its data but cannot be used.
     if (user.account_status or "active") == "suspended":
         return jsonify({
@@ -131,7 +170,7 @@ def refresh_session():
     """
     identity = get_jwt_identity()
     user = User.query.get(identity)
-    if not user:
+    if not user or (user.account_status or "active") == "suspended":
         resp = jsonify({"error": "Session no longer valid"})
         unset_jwt_cookies(resp)
         return resp, 401
@@ -294,6 +333,8 @@ def reset_password():
             return jsonify({"error": RESET_BAD_CODE}), 400
         return jsonify({"error": exc.message}), exc.code
     user.password_hash = generate_password_hash(new_password)
+    user.failed_logins = 0
+    user.login_locked_until = None
     db.session.commit()
     # The old password may be how someone else got in: sign out everywhere.
     revoke_all_sessions(user.id)
@@ -304,11 +345,17 @@ def reset_password():
 @jwt_required()
 def change_password():
     user = current_user()
-    data = request.get_json()
-    if not check_password_hash(user.password_hash, data.get("current_password", "")):
+    data = request.get_json(silent=True) or {}
+    if not check_password_hash(user.password_hash, str(data.get("current_password") or "")):
         return jsonify({"error": "Current password is incorrect"}), 400
-    if len(data.get("new_password", "")) < 8:
+    new_password = str(data.get("new_password") or "")
+    if len(new_password) < 8:
         return jsonify({"error": "New password must be at least 8 characters"}), 400
-    user.password_hash = generate_password_hash(data["new_password"])
+    if len(new_password) > 128:
+        return jsonify({"error": "Password must be at most 128 characters"}), 400
+    user.password_hash = generate_password_hash(new_password)
     db.session.commit()
+    # Same as a reset: every other device is signed out (the old password
+    # may be how someone else got in). This device stays signed in.
+    revoke_all_sessions(user.id, keep_jti=get_jwt().get("sid"))
     return jsonify({"message": "Password updated"})

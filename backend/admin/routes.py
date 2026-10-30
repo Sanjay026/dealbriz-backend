@@ -115,11 +115,29 @@ def admin_update_user(uid):
     u = User.query.get(uid)
     if not u:
         return jsonify({"error": "Not found"}), 404
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
 
-    for field in ["first_name", "last_name", "phone", "city"]:
-        if field in data:
-            setattr(u, field, data[field])
+    # Changing someone's details is an edit, not a view: it needs
+    # users.suspend (admin and superadmin by default), and only a superadmin
+    # may change another staff member's details. Before this, the read-only
+    # dev role could rename a superadmin.
+    profile_fields = [f for f in ("first_name", "last_name", "phone", "city") if f in data]
+    if profile_fields:
+        if not has_capability(caller, "users.suspend"):
+            return jsonify({"error": "You don't have permission to change user details.",
+                            "required": "users.suspend"}), 403
+        if u.id != caller.id and not is_superadmin(caller) and get_user_role_names(u.id):
+            return jsonify({"error": "Only a superadmin can change a staff member's details."}), 403
+        from validation import Invalid, clean_profile
+        try:
+            clean = clean_profile(data)
+        except Invalid as exc:
+            return jsonify({"error": exc.message}), 400
+        for field, value in clean.items():
+            setattr(u, field, value)
+        if "phone" in clean:
+            Product.query.filter_by(posted_by=u.id).update(
+                {Product.seller_phone: u.phone}, synchronize_session=False)
 
     # Only superadmins can grant/revoke staff roles. A user holds at most
     # one active staff role at a time — assigning a new one deactivates
@@ -250,8 +268,12 @@ def suspend_user(uid):
         return jsonify({"error": "Not found"}), 404
     if u.id == caller.id:
         return jsonify({"error": "Cannot suspend your own account"}), 400
+    # A staff account (any role) is suspended or reinstated by a superadmin
+    # only. Before this an admin could suspend a superadmin.
+    if get_user_role_names(u.id) and not is_superadmin(caller):
+        return jsonify({"error": "Only a superadmin can suspend or reinstate a staff account."}), 403
 
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     suspend = bool(data.get("suspended", True))
 
     outbox = None
@@ -276,6 +298,12 @@ def suspend_user(uid):
         affected = Product.query.filter_by(posted_by=u.id, status="removed").update({"status": "active"})
 
     db.session.commit()
+    if suspend:
+        # Signs them out everywhere, at once: the access token carries its
+        # session id, so revoking the session stops it on the next request.
+        # Before this a suspended user stayed signed in for up to 180 days.
+        from security import revoke_all_sessions
+        revoke_all_sessions(u.id)
     if outbox:
         outbox.send()
     d = u.to_dict()
@@ -497,7 +525,13 @@ def admin_update_product(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+    # Same field checks as the seller's own create and edit (validation.py).
+    from validation import Invalid, clean_listing
+    try:
+        data.update(clean_listing(data, product=p))
+    except Invalid as exc:
+        return jsonify({"error": exc.message}), 400
 
     # DealLock: changing a reserved listing's status releases its deal (no
     # strike for the seller), and nobody sets "reserved" by hand.

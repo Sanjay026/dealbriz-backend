@@ -6,6 +6,7 @@ from flask_jwt_extended import jwt_required, verify_jwt_in_request
 
 from extensions import db
 from models import BlogPost, User
+from permissions import has_capability
 from utils import current_user, has_staff_access
 
 bp = Blueprint("blog", __name__, url_prefix="/api/blog")
@@ -73,7 +74,7 @@ def get_post(slug):
 @jwt_required()
 def create_post():
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "blog.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
 
     data = request.get_json() or {}
@@ -101,7 +102,7 @@ def create_post():
 @jwt_required()
 def update_post(pid):
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "blog.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
 
     post = BlogPost.query.get(pid)
@@ -140,7 +141,7 @@ def update_post(pid):
 @jwt_required()
 def delete_post(pid):
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "blog.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
     post = BlogPost.query.get(pid)
     if not post:

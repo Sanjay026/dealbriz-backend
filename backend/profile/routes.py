@@ -33,11 +33,18 @@ def get_profile():
 @jwt_required()
 def update_profile():
     user = current_user()
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     old_phone = user.phone
-    for field in ["first_name", "last_name", "phone", "city"]:
-        if field in data:
-            setattr(user, field, data[field])
+    # Same rules as signup (validation.py). These were saved exactly as
+    # sent, so a name like <img src=x onerror=...> reached the chat list and
+    # the admin tables of everyone who saw it.
+    from validation import Invalid, clean_profile
+    try:
+        clean = clean_profile(data)
+    except Invalid as exc:
+        return jsonify({"error": exc.message}), 400
+    for field, value in clean.items():
+        setattr(user, field, value)
 
     # Listings keep their own copy of the seller's phone and show/hide flag
     # (that's what /api/buy returns), so account changes are copied onto all
@@ -80,18 +87,17 @@ def upload_avatar():
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
 
-    ALLOWED = {"jpg", "jpeg", "png", "webp"}
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else ""
-    if ext not in ALLOWED:
-        return jsonify({"error": "Only JPG, PNG or WEBP images are allowed"}), 400
-    if file.mimetype and not file.mimetype.startswith("image/"):
-        return jsonify({"error": "That file is not an image"}), 400
+    # Checked by the file's own bytes, not its name or claimed type
+    # (storage.check_image).
+    from storage import check_image, save_upload
+    ext, content_type, problem = check_image(file, allowed=("jpg", "png", "webp"))
+    if problem:
+        return jsonify({"error": problem}), 400
 
     old_url = user.avatar_url
     filename = f"avatar_{user.id}_{uuid.uuid4().hex}.{ext}"
     try:
-        from storage import save_upload
-        user.avatar_url = save_upload(file, filename)
+        user.avatar_url = save_upload(file, filename, content_type)
     except Exception:
         current_app.logger.error("Avatar upload failed", exc_info=True)
         return jsonify({"error": "Could not save that image. Please try again."}), 500

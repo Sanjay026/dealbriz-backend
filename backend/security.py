@@ -96,6 +96,15 @@ def register_jwt_handlers(app, jwt):
             return False
         try:
             session = UserSession.query.filter_by(jwt_token_hash=_token_hash(jti)).first()
+            # A suspended account is signed out on its next request, whatever
+            # its tokens say. Suspending also revokes its sessions; this
+            # covers tokens from before session rows existed.
+            from models import User
+            status = (db.session.query(User.account_status)
+                      .filter(User.id == (session.user_id if session else jwt_payload.get("sub")))
+                      .scalar())
+            if (status or "active") == "suspended":
+                return True
             # Unknown tokens are allowed through: sessions issued before this
             # feature existed have no row, and rejecting them would log out
             # every current user on deploy. Only an explicit revocation blocks.
@@ -172,12 +181,16 @@ def revoke_session(jti):
         return False
 
 
-def revoke_all_sessions(user_id):
+def revoke_all_sessions(user_id, keep_jti=None):
     """Used when a password changes: every other device must be signed out,
-    since the old password may be how an attacker got in."""
+    since the old password may be how an attacker got in. keep_jti keeps
+    that one session (the device changing its own password)."""
     from models import UserSession
     try:
-        count = UserSession.query.filter_by(user_id=user_id, is_active=True).update({"is_active": False})
+        q = UserSession.query.filter_by(user_id=user_id, is_active=True)
+        if keep_jti:
+            q = q.filter(UserSession.jwt_token_hash != _token_hash(keep_jti))
+        count = q.update({"is_active": False}, synchronize_session=False)
         db.session.commit()
         return count
     except Exception as exc:

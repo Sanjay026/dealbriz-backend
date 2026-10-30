@@ -51,7 +51,7 @@ def create_product():
     from deals.service import ban_message, is_banned
     if is_banned(user):
         return jsonify({"error": ban_message(user), "deal_ban_until": user.to_dict()["deal_ban_until"]}), 403
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     required = ["title", "category", "condition", "price", "city"]
     if not all(data.get(f) for f in required):
         return jsonify({"error": "Missing required fields"}), 400
@@ -60,25 +60,23 @@ def create_product():
     if not str(data.get("description") or "").strip():
         return jsonify({"error": "Please add a description."}), 400
 
-    # Price: min="0" on the input only constrains the spinner and browser
-    # validation, and a direct POST skips both. A negative price would break
-    # every listing that renders it and any EMI calculation built on it.
+    # Every field checked on the server (validation.py): a direct POST skips
+    # the form. Price in range, short fields without < >, and photos only
+    # from our own storage, since they end up inside <img src="...">.
+    from validation import Invalid, clean_listing
     try:
-        price = float(data["price"])
-    except (TypeError, ValueError):
-        return jsonify({"error": "Price must be a number"}), 400
-    if price < 0:
-        return jsonify({"error": "Price cannot be negative"}), 400
-    if price > 99999999:
-        return jsonify({"error": "Price is too large"}), 400
-    data["price"] = price
+        clean = clean_listing(data)
+    except Invalid as exc:
+        return jsonify({"error": exc.message}), 400
+    data.update(clean)
+    extra = clean.get("extra_images") or []
 
     p = Product(
         title=data["title"], category=data["category"], condition=data["condition"],
         price=data["price"], original_price=data.get("original_price"),
-        negotiable=data.get("negotiable", False), emi_eligible=data.get("emi_eligible", True),
-        description=str(data.get("description")).strip(), image_url=data.get("image_url"),
-        extra_images=",".join(data.get("extra_images", [])) if data.get("extra_images") else None,
+        negotiable=bool(data.get("negotiable", False)), emi_eligible=bool(data.get("emi_eligible", True)),
+        description=data["description"], image_url=data.get("image_url"),
+        extra_images=",".join(extra) if extra else None,
         posted_by=user.id, seller_name=f"{user.first_name} {user.last_name}".strip(),
         seller_avatar=user.avatar_url, seller_phone=user.phone,
         # The account-wide Profile setting decides, in both directions. The
@@ -199,19 +197,17 @@ def upload_product_image():
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
 
-    # Validate by extension AND declared type. An unrestricted upload
-    # endpoint is how a marketplace ends up hosting someone else's malware.
-    ALLOWED = {"jpg", "jpeg", "png", "webp", "gif"}
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ALLOWED:
-        return jsonify({"error": "Only JPG, PNG, WEBP or GIF images are allowed"}), 400
-    if file.mimetype and not file.mimetype.startswith("image/"):
-        return jsonify({"error": "That file is not an image"}), 400
+    # Validated by the file's own bytes (storage.check_image), not its name
+    # or claimed type: an unrestricted upload endpoint is how a marketplace
+    # ends up hosting someone else's malware or script.
+    from storage import check_image, save_upload
+    ext, content_type, problem = check_image(file)
+    if problem:
+        return jsonify({"error": problem}), 400
 
     filename = f"product_{user.id}_{uuid.uuid4().hex}.{ext}"
     try:
-        from storage import save_upload
-        url = save_upload(file, filename)
+        url = save_upload(file, filename, content_type)
     except Exception:
         current_app.logger.error("Upload failed", exc_info=True)
         return jsonify({"error": "Could not save that image. Please try again."}), 500

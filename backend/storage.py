@@ -43,7 +43,41 @@ def is_s3():
     return STORAGE_BACKEND == "s3" and bool(S3_BUCKET)
 
 
-def save_upload(file_storage, filename=None):
+IMAGE_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif"}
+
+
+def check_image(file_storage, allowed=("jpg", "png", "webp", "gif")):
+    """What a photo really is, from its first bytes. Returns (ext,
+    content_type, None) or (None, None, error message).
+
+    The name and the type the browser claims are both chosen by whoever
+    sends the request, so neither decides: an SVG with script named x.png
+    and sent as image/svg+xml used to be stored, and served from S3 with
+    that type. Only real JPG/PNG/WEBP/GIF bytes are accepted, and the
+    stored type comes from those bytes."""
+    if not file_storage or not file_storage.filename:
+        return None, None, "No file selected"
+    head = file_storage.stream.read(16)
+    file_storage.stream.seek(0)
+    kind = None
+    if head.startswith(b"\xff\xd8\xff"):
+        kind = "jpg"
+    elif head.startswith(b"\x89PNG\r\n\x1a\n"):
+        kind = "png"
+    elif head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        kind = "webp"
+    elif head[:6] in (b"GIF87a", b"GIF89a"):
+        kind = "gif"
+    elif head[4:8] == b"ftyp":
+        return None, None, ("This photo is in HEIC format. Please upload it as JPG "
+                            "(or take a screenshot of it and upload that).")
+    if kind is None or kind not in allowed:
+        names = ", ".join(a.upper() for a in allowed[:-1]) + " or " + allowed[-1].upper()
+        return None, None, f"Only {names} images are allowed"
+    return kind, IMAGE_TYPES[kind], None
+
+
+def save_upload(file_storage, filename=None, content_type=None):
     """Stores an uploaded file and returns the public URL path.
 
     Returns a path like "/uploads/abc.jpg" for local, or a full URL for S3.
@@ -59,7 +93,8 @@ def save_upload(file_storage, filename=None):
         return f"/uploads/{name}"
 
     key = f"{S3_PREFIX}{name}"
-    content_type = (file_storage.mimetype
+    # The caller's checked type (check_image) wins over the browser's claim.
+    content_type = (content_type
                     or mimetypes.guess_type(name)[0]
                     or "application/octet-stream")
     try:

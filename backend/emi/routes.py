@@ -75,60 +75,51 @@ def build_emi_application(user, data, price_override=None):
             "reason": availability.get("reason"),
             "pincode": checked,
         }), 403)
-    # Snapshot of the listing as it was when the buyer applied. Taken from
-    # the database when the listing exists, so the stored title and price
-    # are the real ones rather than whatever the client sent.
+    # Snapshot of the listing as it was when the buyer applied, always from
+    # the database. The request used to be able to name any title, price and
+    # photo ("product_*_snapshot") and choose every figure; those fields are
+    # now ignored and the figures are worked out here.
     product = Product.query.get(data["product_id"]) if data.get("product_id") else None
-    title = (product.title if product else data.get("product_title_snapshot")) or ""
-    image = (product.image_url if product else data.get("product_image_snapshot")) or None
-    price = product.price if product else data.get("product_price_snapshot")
-    if price_override is not None:
-        price = price_override
+    if product is None:
+        return None, (jsonify({"error": "Choose the listing you're applying for."}), 400)
+    if price_override is None and product.status not in ("active", "reserved"):
+        return None, (jsonify({"error": "This listing is no longer available."}), 409)
+    title = product.title or ""
+    image = product.image_url or None
+    price = price_override if price_override is not None else product.price
 
-    # Every one of these is NOT NULL in emi_applications. Reading them with
-    # data["..."] turned a missing field into a KeyError and a bare 500, so
-    # the caller never learned what was wrong.
-    fields = {
-        "tenure_months": data.get("tenure_months"),
-        "interest_rate": data.get("interest_rate"),
-        "loan_amount": data.get("loan_amount"),
-        "monthly_emi": data.get("monthly_emi"),
-        "total_payable": data.get("total_payable"),
-    }
-    missing = [k for k, v in fields.items() if v in (None, "")]
-    name = str(data.get("applicant_name") or "").strip()
-    phone = str(data.get("applicant_phone") or "").strip()
-    if not title:
-        missing.append("product_title_snapshot")
-    if price in (None, ""):
-        missing.append("product_price_snapshot")
-    if not name:
-        missing.append("applicant_name")
-    if not phone:
-        missing.append("applicant_phone")
-    if missing:
-        return None, (jsonify({"error": "Please fill in all the details: " + ", ".join(missing)}), 400)
+    from deals import rules
+    from validation import Invalid, phone as valid_phone, short_text
+    try:
+        name = short_text(data.get("applicant_name"), "name", 200, required=True)
+        phone = valid_phone(data.get("applicant_phone"))
+    except Invalid as exc:
+        return None, (jsonify({"error": exc.message}), 400)
 
     try:
-        tenure = int(fields["tenure_months"])
-        numbers = {k: float(fields[k]) for k in ("interest_rate", "loan_amount", "monthly_emi", "total_payable")}
+        tenure = int(data.get("tenure_months"))
+        rate = float(data.get("interest_rate")) if price_override is None else float(rules.LOAN_RATE_MAX)
         price = float(price)
         down = float(data.get("down_payment") or 0)
         income = data.get("applicant_income")
         income = float(income) if income not in (None, "") else None
     except (TypeError, ValueError):
         return None, (jsonify({"error": "Some amounts in the application are not valid numbers."}), 400)
-    if tenure <= 0 or numbers["loan_amount"] < 0 or price <= 0:
+    if not (1 <= tenure <= 84) or not (1 <= rate <= 36) or price <= 0:
         return None, (jsonify({"error": "Some amounts in the application are not valid."}), 400)
-    if price_override is not None and (numbers["loan_amount"] > price or down < 0 or down > price):
-        return None, (jsonify({"error": "The loan and down payment can't be more than the agreed price."}), 400)
+    if down < 0 or down >= price:
+        return None, (jsonify({"error": "The down payment must be less than the price."}), 400)
+    if income is not None and not (0 <= income <= 1e9):
+        return None, (jsonify({"error": "The monthly income isn't valid."}), 400)
+    loan = round(price - down)
+    monthly, total = rules.emi_estimate(loan, tenure, rate)
 
     emi = EmiApplication(
-        user_id=user.id, product_id=product.id if product else None,
+        user_id=user.id, product_id=product.id,
         product_title_snapshot=title[:200], product_image_snapshot=image,
         product_price_snapshot=price, down_payment=down, tenure_months=tenure,
-        interest_rate=numbers["interest_rate"], loan_amount=numbers["loan_amount"],
-        monthly_emi=numbers["monthly_emi"], total_payable=numbers["total_payable"],
+        interest_rate=rate, loan_amount=loan,
+        monthly_emi=monthly, total_payable=total,
         applicant_name=name[:200], applicant_phone=phone[:20],
         applicant_income=income, status="pending"
     )

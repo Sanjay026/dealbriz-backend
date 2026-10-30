@@ -6,7 +6,14 @@ from flask_jwt_extended import jwt_required
 from extensions import db
 from models import Product, EmiApplication, Purchase, PurchaseUser, User
 from models.product import normalize_show_phone, SHOW_PHONE_NO
-from utils import current_user, has_staff_access
+from utils import current_user
+
+
+def _staff_may_edit(user):
+    """Staff acting on someone else's listing need products.edit (the
+    Roles page decides), not just any staff role."""
+    from permissions import has_capability
+    return bool(user) and has_capability(user, "products.edit")
 
 bp = Blueprint("mylistings", __name__, url_prefix="/api/my-listings")
 
@@ -66,7 +73,7 @@ def get_my_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
     return jsonify(p.to_dict())
 
@@ -78,13 +85,21 @@ def update_my_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
 
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     # An edit may leave description out (e.g. mark sold), but can't blank it.
     if "description" in data and not str(data.get("description") or "").strip():
         return jsonify({"error": "Please add a description."}), 400
+    # Same checks as creating the listing (validation.py). Before this, an
+    # edit could set a negative price, any category, or a photo address that
+    # broke out of the page's <img src="...">.
+    from validation import Invalid, clean_listing
+    try:
+        data.update(clean_listing(data, product=p))
+    except Invalid as exc:
+        return jsonify({"error": exc.message}), 400
 
     # DealLock: a reserved listing's status belongs to its deal.
     outbox = None
@@ -139,7 +154,7 @@ def sell_my_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
 
     # DealLock: marking a reserved listing sold would abandon the buyer the
@@ -203,7 +218,7 @@ def unsell_my_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
     if p.status != "sold":
         return jsonify({"error": "This listing is not marked sold."}), 400
@@ -261,7 +276,7 @@ def feature_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
     if p.status != "active":
         return jsonify({"error": "Only active listings can be promoted"}), 400
@@ -289,7 +304,7 @@ def unfeature_listing(pid):
     p = Product.query.get(pid)
     if not p:
         return jsonify({"error": "Not found"}), 404
-    if p.posted_by != user.id and not has_staff_access(user):
+    if p.posted_by != user.id and not _staff_may_edit(user):
         return jsonify({"error": "Forbidden"}), 403
 
     p.featured_until = None

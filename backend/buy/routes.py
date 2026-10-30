@@ -10,7 +10,8 @@ from models import Product
 
 bp = Blueprint("buy", __name__, url_prefix="/api/buy")
 
-MAX_PER_PAGE = 500  # matches the buyer-facing page-size selector's max
+MAX_PER_PAGE = 100  # the website's page-size selector stops at 100 too. Was 500,
+                    # which let a script copy the whole marketplace in a few requests.
 DEFAULT_PER_PAGE = 30
 
 
@@ -201,10 +202,27 @@ def search_products():
     return paginated_response(q, request.args)
 
 
+def _may_see_removed(product):
+    from flask_jwt_extended import verify_jwt_in_request
+    from permissions import has_capability
+    from utils import current_user
+    try:
+        verify_jwt_in_request(optional=True)
+        user = current_user()
+    except Exception:
+        return False
+    return bool(user) and (user.id == product.posted_by or has_capability(user, "products.view"))
+
+
 @bp.route("/<pid>", methods=["GET"])
 def get_product(pid):
     p = Product.query.get(pid)
     if not p:
+        return jsonify({"error": "Not found"}), 404
+    # A removed listing (deleted by its seller, or hidden by a suspension)
+    # isn't public any more, phone number included. Its seller and staff
+    # can still open it.
+    if p.status == "removed" and not _may_see_removed(p):
         return jsonify({"error": "Not found"}), 404
     d = p.to_dict()
     # DealLock: "pending" while a deal waits for the seller or documents

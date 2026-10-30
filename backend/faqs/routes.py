@@ -3,6 +3,7 @@ from flask_jwt_extended import jwt_required
 
 from extensions import db
 from models import Faq
+from permissions import has_capability
 from utils import current_user, has_staff_access
 
 bp = Blueprint("faqs", __name__, url_prefix="/api/faqs")
@@ -61,7 +62,7 @@ def list_faqs():
 @jwt_required()
 def create_faq():
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "faqs.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
 
     data = request.get_json() or {}
@@ -91,7 +92,7 @@ def create_faq():
 @jwt_required()
 def update_faq(fid):
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "faqs.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
 
     faq = Faq.query.get(fid)
@@ -130,7 +131,7 @@ def update_faq(fid):
 @jwt_required()
 def delete_faq(fid):
     user = current_user()
-    if not has_staff_access(user):
+    if not (user and has_capability(user, "faqs.manage")):  # was any staff role
         return jsonify({"error": "Forbidden"}), 403
     faq = Faq.query.get(fid)
     if not faq:

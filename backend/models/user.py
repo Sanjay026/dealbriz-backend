@@ -41,6 +41,10 @@ class User(db.Model):
     # Restrictions); empty for the automatic one after force cancels.
     # ddb/migration_user_restrictions.sql.
     deal_ban_reason = db.Column(db.String(255))
+    # Login lockout (ddb/migration_login_lockout.sql): wrong passwords in a
+    # row, and sign-in refused until this time after LOGIN_MAX_FAILS of them.
+    failed_logins = db.Column(db.Integer, nullable=False, default=0)
+    login_locked_until = db.Column(db.DateTime)
 
     def to_dict(self):
         return {
