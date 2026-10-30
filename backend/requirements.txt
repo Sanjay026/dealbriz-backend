@@ -18,3 +18,8 @@ rapidocr_onnxruntime==1.4.4
 opencv-python>=4.8
 numpy
 pymupdf>=1.24
+# AI help assistant (chatbot/ai.py): LangChain, with xAI Grok / Groq (OpenAI-compatible API)
+# or a local Ollama. Imported only when LLM_PROVIDER is set.
+langchain-core==1.6.13
+langchain-openai==1.6.7
+langchain-ollama==1.0.1

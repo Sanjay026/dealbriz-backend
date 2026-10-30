@@ -252,7 +252,8 @@ def parse_query(raw, brands=None, models=None):
 
     # ---- 6. Category -------------------------------------------------
     words = set(re.findall(r"[a-z]+", text))
-    for slug, terms in CATEGORY_WORDS.items():
+    from categories.util import merged_search_words   # + categories added in the admin panel
+    for slug, terms in merged_search_words(CATEGORY_WORDS).items():
         if words & terms:
             q.category = slug
             q.matched.append(slug.title())

@@ -65,7 +65,8 @@ def detect_category(message):
     text = re.sub(r"[^a-z0-9\s]", " ", (message or "").lower())
     words = set(text.split())
     words |= {stem(w) for w in words}
-    for slug, terms in _CATEGORY_STEMS.items():
+    from categories.util import merged_search_words   # + categories added in the admin panel
+    for slug, terms in merged_search_words(_CATEGORY_STEMS).items():
         if words & terms:
             return slug
     return None

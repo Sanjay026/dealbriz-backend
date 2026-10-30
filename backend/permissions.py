@@ -64,6 +64,9 @@ CAPABILITIES = {
     # Platform switches
     "settings.manage",
 
+    # Listing categories (Admin -> Categories): add, rename, hide, reorder.
+    "categories.manage",
+
     # Diagnostics. Separate from settings.manage because reading logs and
     # changing platform behaviour are different jobs: a developer needs the
     # first to debug, and shouldn't need the second to do it.
@@ -87,6 +90,7 @@ ROLE_CAPABILITIES = {
         "financers.view", "financers.manage",
         "reports.view", "reports.resolve",
         "faqs.manage", "blog.manage",
+        "categories.manage",
     },
 
     # Front-line moderation. Can review and act on queues, but cannot
@@ -145,6 +149,8 @@ SECTION_CAPABILITY = {
     "faqs": "faqs.manage",
     "chatbot": "faqs.manage",
     "logs": "logs.view",
+    "categories": "categories.manage",
+    "analytics": "dashboard.view",
     "blog": "blog.manage",
     "terms": "legal.edit",
 }

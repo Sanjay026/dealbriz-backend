@@ -139,7 +139,7 @@ def public_rules():
     """What the clients need to word the UI ("valid for 48 hours" etc.)."""
     return {
         "categories": list(CATEGORIES),
-        "vehicle_categories": list(VEHICLE_CATEGORIES),
+        "vehicle_categories": _vehicle_categories(),
         "offer_valid_hours": OFFER_HOURS,
         "max_counter_rounds": MAX_COUNTERS,
         "confirm_hours": CONFIRM_HOURS,
@@ -205,7 +205,19 @@ SELLER_DOC_TYPES = tuple(t for t in DOC_TYPES if DOC_PARTY[t] == "seller")
 
 
 def is_vehicle_category(category):
+    """Vehicle = RC + insurance on the listing and vehicle loans. Set per
+    category in Admin -> Categories (categories table). Before that table
+    exists, DEALLOCK_VEHICLE_CATEGORIES (default cars,bikes) decides."""
+    from categories import util
+    cat = util.get(category)
+    if cat is not None:
+        return bool(cat["is_vehicle"])
     return (category or "").lower() in VEHICLE_CATEGORIES
+
+
+def _vehicle_categories():
+    from categories import util
+    return util.vehicle_slugs()
 
 
 def listing_possible_docs(category):

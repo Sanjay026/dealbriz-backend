@@ -179,6 +179,15 @@ def clean_listing(data, product=None):
             raise Invalid("The title can't contain < or >.")
     if has("category"):
         out["category"] = code(data.get("category"), "category")
+        # Must be a category from Admin -> Categories. A new listing needs a
+        # shown one; an edit may keep the hidden category it already has.
+        from categories import util as cat_util
+        known = cat_util.get(out["category"])
+        unchanged = product is not None and out["category"] == (product.category or "")
+        if known is None and not unchanged:
+            raise Invalid("Please choose a category from the list.")
+        if known is not None and not known["is_active"] and not unchanged:
+            raise Invalid("That category isn't available for new listings any more. Please choose another.")
     if has("condition"):
         out["condition"] = code(data.get("condition"), "condition")
     if has("price"):

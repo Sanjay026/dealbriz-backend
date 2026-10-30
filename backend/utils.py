@@ -11,6 +11,8 @@ from models import User, Role, Admin
 
 def current_user():
     uid = get_jwt_identity()
+    if not uid:   # nobody signed in (optional-JWT routes): no lookup, no SAWarning
+        return None
     return User.query.get(uid)
 
 

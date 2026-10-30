@@ -131,7 +131,18 @@ def chat():
                 "action": ({"type": "page", **action} if action else None),
             })
 
-    # ---- 2. Live listings, when that's clearly what's being asked ----
+    # ---- 2. The AI assistant (chatbot/ai.py), when it's switched on -----
+    # Read-only tools only: public listings, help articles, and the
+    # signed-in user's OWN deals, offers and EMI applications (user from
+    # the session cookie, never from the request). Off, failing or slow:
+    # None, and the rule-based answers below take over.
+    from . import ai
+    if ai.enabled():
+        result = ai.answer(message, user=user, pincode=viewer_pincode, history=data.get("history"))
+        if result:
+            return jsonify({"reply": result["reply"], "source": "ai", "action": result["action"]})
+
+    # ---- 3. Live listings, when that's clearly what's being asked ----
     if looks_like_inventory(message):
         handler_name, result = try_marketplace(message, viewer_pincode)
         if result:
@@ -141,7 +152,7 @@ def chat():
                 "action": ({"type": "page", **action} if action else None),
             })
 
-    # ---- 3. FAQ knowledge base -------------------------------------
+    # ---- 4. FAQ knowledge base -------------------------------------
     # Checked before live data: "how does EMI work" is a procedure question
     # and deserves the written explanation, not a count of listings.
     faq, score = best_faq_match(message)
@@ -152,7 +163,7 @@ def chat():
             "related": suggest_related(message, exclude_id=faq.faq_id),
         })
 
-    # ---- 4. Live marketplace data ----------------------------------
+    # ---- 5. Live marketplace data ----------------------------------
     # Real queries against current listings, partners and coverage, so the
     # answer changes as the database does.
     handler_name, result = try_marketplace(message, viewer_pincode)
@@ -163,7 +174,7 @@ def chat():
             "action": ({"type": "page", **action} if action else None),
         })
 
-    # ---- 5. Nothing matched: hand over, don't guess -----------------
+    # ---- 6. Nothing matched: hand over, don't guess -----------------
     record_unanswered(message, score)
     return jsonify({
         "reply": FALLBACK, "source": "fallback",
