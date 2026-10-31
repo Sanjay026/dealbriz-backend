@@ -58,13 +58,34 @@ def ip_hash(ip):
 
 
 def _viewer():
+    """Who is looking, for counting only (never for permission).
+
+    Access tokens last 30 minutes. Once one expires, verify_jwt_in_request
+    raises, and treating that as "not signed in" made a seller count as an
+    anonymous visitor on their own listing, and counted a buyer a second
+    time under an anonymous key. So if the normal check fails, read the
+    access cookie again with expiry allowed. The signature is still checked,
+    so the identity can't be forged. It only decides who is excluded or
+    which key a view is counted under. It grants nothing."""
+    from flask_jwt_extended import decode_token, verify_jwt_in_request
+    from models import User
+    from utils import current_user
     try:
-        from flask_jwt_extended import verify_jwt_in_request
-        from utils import current_user
         verify_jwt_in_request(optional=True)
         return current_user()
     except Exception:
+        pass
+    token = request.cookies.get(current_app.config.get("JWT_ACCESS_COOKIE_NAME") or "access_token_cookie")
+    if not token:
         return None
+    try:
+        claims = decode_token(token, allow_expired=True)
+    except Exception:
+        return None
+    uid = claims.get(current_app.config.get("JWT_IDENTITY_CLAIM") or "sub")
+    if claims.get("type") != "access" or not uid:
+        return None
+    return db.session.get(User, str(uid))
 
 
 @bp.route("/api/track", methods=["POST"])

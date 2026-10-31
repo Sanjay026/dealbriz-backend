@@ -235,11 +235,44 @@ def get_product(pid):
 
 @bp.route("/<pid>/view", methods=["POST"])
 def increment_view(pid):
+    """Counts a view once per person (product_views has one row per person
+    per listing). Opening the same listing again, the seller opening their
+    own listing, staff and bots don't add to products.views.
+
+    A signed-in person is counted by account. Someone not signed in is
+    counted by a keyed hash of IP + browser (analytics.routes.ip_hash), so
+    no raw IP is stored. Answers {"ok": true, "counted": bool}."""
+    from sqlalchemy import insert
+    from analytics.routes import _viewer, device_type, ip_hash
+    from models import ProductView
+    from utils import has_staff_access
     p = Product.query.get(pid)
-    if p:
-        p.views += 1
-        db.session.commit()
-    return jsonify({"ok": True})
+    if not p:
+        return jsonify({"ok": True, "counted": False})
+    if device_type(request.headers.get("User-Agent", "")) == "bot":
+        return jsonify({"ok": True, "counted": False})
+    user = _viewer()
+    if user is not None and (user.id == p.posted_by or has_staff_access(user)):
+        return jsonify({"ok": True, "counted": False})
+    if user is not None:
+        key = f"u:{user.id}"
+    else:
+        ua = (request.headers.get("User-Agent") or "")[:300]
+        key = "a:" + ip_hash(f"{request.remote_addr or ''}|{ua}")
+    now = datetime.utcnow()
+    # INSERT IGNORE: if this person already has a row, nothing happens, even
+    # when two requests arrive at once (the unique key decides).
+    res = db.session.execute(insert(ProductView).prefix_with("IGNORE").values(
+        product_id=p.id, viewer_key=key, first_viewed_at=now, last_viewed_at=now))
+    counted = res.rowcount == 1
+    if counted:
+        Product.query.filter_by(id=p.id).update({Product.views: func.coalesce(Product.views, 0) + 1},
+                                                synchronize_session=False)
+    else:
+        ProductView.query.filter_by(product_id=p.id, viewer_key=key).update(
+            {ProductView.last_viewed_at: now}, synchronize_session=False)
+    db.session.commit()
+    return jsonify({"ok": True, "counted": counted})
 
 
 # ===================== NATURAL-LANGUAGE SEARCH =====================

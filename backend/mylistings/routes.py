@@ -242,6 +242,27 @@ def unsell_my_listing(pid):
     return jsonify(p.to_dict()), 200
 
 
+@bp.route("/<pid>/views", methods=["GET"])
+@jwt_required()
+def listing_views(pid):
+    """How many people viewed this listing (each person once): in total, in
+    the last 7 days and in the last 24 hours. The seller, or staff."""
+    from models import ProductView
+    user = current_user()
+    p = Product.query.get(pid)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    if p.posted_by != user.id and not _staff_may_edit(user):
+        return jsonify({"error": "Forbidden"}), 403
+    now = datetime.utcnow()
+
+    def since(delta):
+        return ProductView.query.filter(ProductView.product_id == p.id,
+                                        ProductView.first_viewed_at >= now - delta).count()
+    return jsonify({"product_id": p.id, "total": int(p.views or 0),
+                    "last_7_days": since(timedelta(days=7)), "last_24_hours": since(timedelta(hours=24))})
+
+
 # How long a "Show at top" promotion lasts, by plan. Values are days.
 # Priced as a placeholder for now — billing is not wired up, so promoting is
 # free at this stage and the price shown in the UI is indicative only.
