@@ -76,8 +76,13 @@ def all_categories():
     return rows
 
 
+# Categories DealBriz no longer deals in. Never shown or accepted, whatever
+# the categories table says (it may still hold the row).
+RETIRED = {"property"}
+
+
 def active_categories():
-    return [c for c in all_categories() if c["is_active"]]
+    return [c for c in all_categories() if c["is_active"] and c["slug"] not in RETIRED]
 
 
 def get(slug):

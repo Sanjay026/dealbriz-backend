@@ -186,7 +186,7 @@ def clean_listing(data, product=None):
         unchanged = product is not None and out["category"] == (product.category or "")
         if known is None and not unchanged:
             raise Invalid("Please choose a category from the list.")
-        if known is not None and not known["is_active"] and not unchanged:
+        if known is not None and (not known["is_active"] or known["slug"] in cat_util.RETIRED) and not unchanged:
             raise Invalid("That category isn't available for new listings any more. Please choose another.")
     if has("condition"):
         out["condition"] = code(data.get("condition"), "condition")
