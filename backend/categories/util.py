@@ -23,7 +23,6 @@ DEFAULTS = [
     ("furniture", "Furniture", "fa-couch", "🛋️", False),
     ("appliances", "Appliances", "fa-blender", "🧊", False),
     ("fashion", "Fashion", "fa-shirt", "👗", False),
-    ("property", "Property", "fa-building", "🏢", False),
     ("others", "Others", "fa-box-open", "📦", False),
 ]
 

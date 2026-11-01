@@ -49,12 +49,16 @@ class User(db.Model):
     # for this person ("sub" in the ID token). Set on the first Google
     # sign-in; the email can change at Google, this never does.
     google_sub = db.Column(db.String(255), unique=True)
+    # Profile "Location" (ddb/migration_profile_location.sql): the area name,
+    # filled from the pincode on the profile page or typed by the user.
+    location = db.Column(db.String(120))
 
     def to_dict(self):
         return {
             "id": self.id, "email": self.email,
             "first_name": self.first_name, "last_name": self.last_name,
             "phone": self.phone, "city": self.city,
+            "location": self.location or "",
             "avatar_url": self.avatar_url, "is_admin": self.is_admin,
             "show_phone": self.show_phone,
             "account_status": self.account_status or "active",

@@ -293,7 +293,7 @@ def _system_prompt(user):
         from categories.util import active_categories
         cats = ", ".join(c["label"] for c in active_categories())
     except Exception:
-        cats = "cars, bikes, phones, electronics, furniture, appliances, fashion, property, others"
+        cats = "cars, bikes, phones, electronics, furniture, appliances, fashion, others"
     return f"""You are the DealBriz help assistant. DealBriz (dealbriz.com) is an Indian marketplace for
 pre-owned goods (categories: {cats})
 where buyers can finance purchases with EMI through partner lenders (NBFCs).

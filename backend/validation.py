@@ -238,7 +238,7 @@ def user_city(value):
 
 
 def clean_profile(data):
-    """first_name, last_name, phone, city — whichever are present."""
+    """first_name, last_name, phone, city, location — whichever are present."""
     out = {}
     if "first_name" in data:
         out["first_name"] = short_text(data.get("first_name"), "first name", NAME_MAX, required=True)
@@ -248,4 +248,7 @@ def clean_profile(data):
         out["phone"] = phone(data.get("phone"))
     if "city" in data:
         out["city"] = user_city(data.get("city"))
+    if "location" in data:
+        # Area name, e.g. "Gagal, Mandi". Optional, plain text.
+        out["location"] = short_text(data.get("location"), "location", 120)
     return out
