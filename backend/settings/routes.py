@@ -45,3 +45,41 @@ def update_setting(key):
     row.updated_by = user.id
     db.session.commit()
     return jsonify(all_public_settings())
+
+
+# ===================== ANDROID APP VERSION (force update) =====================
+# Read by the app on launch and whenever it comes back to the foreground.
+#   build < ANDROID_MIN_VERSION_CODE     -> blocking "Update required" screen
+#   build < ANDROID_LATEST_VERSION_CODE  -> dismissible "Update available"
+# Values live in ~/deal_briz/.env (recreate the backend container after a
+# change). Unset or 0 = no check, so a fresh deploy changes nothing.
+
+def _env_int(name):
+    import os
+    try:
+        return max(0, int(str(os.environ.get(name, "0")).strip() or 0))
+    except ValueError:
+        return 0
+
+
+@bp.route("/app-version", methods=["GET"])
+def app_version():
+    """Public, no login: an outdated app must be able to ask before sign-in."""
+    import os
+    url = str(os.environ.get("ANDROID_UPDATE_URL", "")).strip()
+    # Only a web link: the app opens it outside itself, and a stray scheme
+    # (javascript:, intent:) has no business there.
+    if not url.startswith("https://"):
+        url = ""
+    message = str(os.environ.get("ANDROID_UPDATE_MESSAGE", "")).strip()[:300]
+    resp = jsonify({
+        "android": {
+            "min_version_code": _env_int("ANDROID_MIN_VERSION_CODE"),
+            "latest_version_code": _env_int("ANDROID_LATEST_VERSION_CODE"),
+            "update_url": url or None,
+            "message": message or None,
+        }
+    })
+    # Raised the moment a release goes out, so never cached.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
