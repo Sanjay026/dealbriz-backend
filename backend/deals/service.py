@@ -212,9 +212,9 @@ def is_doc_staff(user):
 def can_review_docs(user, deal):
     """Who may open and verify the buyer's and seller's documents: DealBriz
     staff who check documents (is_doc_staff), or a lender (NBFC) in its
-    portal (see lender_may_check). Nobody else, not other staff roles, and
-    not the buyer or seller themselves once uploaded (they see each file's
-    status, never the file)."""
+    portal (see lender_may_check). Nobody else, not other staff roles. (The
+    buyer and seller can open only the files they uploaded themselves; the
+    file routes allow that separately.)"""
     if not user:
         return False
     if is_doc_staff(user):

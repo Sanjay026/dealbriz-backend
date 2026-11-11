@@ -258,13 +258,13 @@ def upload(pid, doc_type):
 @bp.route("/<pid>/files/<doc_id>", methods=["GET"])
 @jwt_required()
 def view_file(pid, doc_id):
-    """A superadmin or a lender that may check this listing. Not the seller
-    (they know what they uploaded) and not buyers: identity documents."""
+    """A superadmin, a lender that may check this listing, or the seller
+    who owns it (their own uploads). Not buyers: identity documents."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
     product = _product(pid)
-    if not product or not ld.can_review(user, product):
+    if not product or not (user.id == product.posted_by or ld.can_review(user, product)):
         return _err("Not found.", 404)
     doc = ListingDocument.query.filter_by(id=doc_id, product_id=product.id).first()
     if not doc:

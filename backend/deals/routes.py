@@ -711,6 +711,8 @@ def deal_detail(deal, user):
     # Opening and verifying files: superadmin or the deal's lender only.
     d["can_review_docs"] = deal.status == DEAL_DOCS_PENDING and can_review_docs(user, deal)
     d["can_view_doc_files"] = can_review_docs(user, deal)
+    # The buyer and seller may also open the files they uploaded themselves.
+    d["can_view_own_doc_files"] = is_party
     # The documents email to the lender: staff and the lender see its state.
     if not is_party and (staff_view or can_review_docs(user, deal)):
         from . import lender_email
@@ -1269,16 +1271,20 @@ def upload_document(deal_id, doc_type):
 @bp.route("/<deal_id>/documents/<doc_id>/file", methods=["GET"])
 @jwt_required()
 def view_document(deal_id, doc_id):
-    """DealBriz admins/superadmins or the deal's own lender, nobody else (not
-    other staff roles, not the buyer or seller). These are identity documents."""
+    """DealBriz admins/superadmins, the deal's own lender, or the buyer or
+    seller who uploaded this very file. Nobody else (not other staff roles,
+    not the other side of the deal). These are identity documents."""
     user = _me()
     if not user:
         return _err("Please sign in again.", 401)
     deal = Deal.query.get(deal_id)
-    if not deal or not can_review_docs(user, deal):
+    if not deal:
         return _err("Not found.", 404)
     doc = DealDocument.query.filter_by(id=doc_id, deal_id=deal.id).first()
     if not doc:
+        return _err("Not found.", 404)
+    own = user.id in (deal.buyer_id, deal.seller_id) and doc.uploaded_by == user.id
+    if not own and not can_review_docs(user, deal):
         return _err("Not found.", 404)
     if not doc.storage_key:
         return _err("This file was deleted after the deal closed.", 410)

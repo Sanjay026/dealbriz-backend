@@ -208,6 +208,7 @@ def view(product, user):
         "can_upload": owner and needs_docs(product) and frozen is None,
         "can_review": can_review(user, product),
         "can_view_files": can_review(user, product),
+        "can_view_own_files": owner,
     }
 
 
