@@ -1,4 +1,5 @@
-"""Auto-check for the buyer's Aadhaar and PAN uploads in a deal.
+"""Auto-check for the buyer's Aadhaar and PAN uploads in a deal, and for the
+seller's Registration Certificate (RC) on a listing.
 
 Uses the local OCR model in ``ModelAdharPan/`` (RapidOCR on ONNX Runtime).
 The heavy imports stay lazy because loading the model takes tens of seconds;
@@ -9,6 +10,10 @@ with a valid number?" Yes: "verified", which the upload treats as approved.
 No (a selfie or an Aadhaar card in the PAN slot, a card whose number can't
 be read or isn't a valid PAN/Aadhaar): refused at upload, so the buyer
 fixes it straight away. Nothing waits in between for a person.
+
+The RC check (see ``_rc_verdict``) asks "is this an RC?" the same way:
+it reads like one ("verified", approved on the spot) or it is refused.
+It does not check who owns the vehicle or that the RC is genuine.
 
 Only the verdict is handled here. The Aadhaar/PAN number itself is never
 returned, logged or stored.
@@ -24,12 +29,39 @@ log = logging.getLogger("dealbridge.id_verify")
 _EXPECTED = {
     "buyer_pan": "pan",
     "buyer_aadhaar": "aadhaar",
+    "rc": "rc",
 }
 
 KIND_NAMES = {
     "pan": "a PAN card",
     "aadhaar": "an Aadhaar card",
+    "insurance": "an insurance policy",
 }
+
+# Words printed on an RC (smart card, paper book or the DigiLocker /
+# mParivahan PDF). Each pattern counts once.
+_RC_KEYWORDS = (
+    r"registration\s*certificate", r"certificate\s*of\s*registration",
+    r"reg(istratio)?n\.?\s*(no|number|mark)", r"registering\s*authority",
+    r"(date\s*of\s*reg|reg(istratio)?n\.?\s*(date|dt|validity|valid))",
+    r"chas+is", r"engine\s*(no|number)|eng\.?\s*no",
+    r"class\s*of\s*vehicle|vehicle\s*class|veh\.?\s*class", r"maker|manufacturer|mfr",
+    r"fuel", r"owner", r"seating|cubic\s*cap|unladen|wheel\s*base|no\.?\s*of\s*cyl",
+    r"month\s*(&|and)?\s*y(ea)?r\.?\s*of\s*m|mfg|m\.?\s*y\.?\s*of\s*mfg",
+    r"hypothecat|financ(i)?er", r"form\s*23", r"motor\s*vehicles?|transport\s*dep",
+    r"body\s*type|colou?r", r"emission\s*norm|bharat\s*stage|bs[\s-]?(iv|vi|4|6)",
+)
+# Only an RC says these; an insurance policy repeats most of the rest.
+_RC_ONLY = (r"registration\s*certificate", r"certificate\s*of\s*registration",
+            r"registering\s*authority", r"form\s*23")
+_INSURANCE_KEYWORDS = (r"insurance", r"polic(y|ies)", r"premium", r"insured", r"insurer",
+                       r"\bidv\b", r"third\s*party", r"own\s*damage", r"no\s*claim")
+_STATE_CODES = frozenset(
+    "AN AP AR AS BR CG CH DD DL DN GA GJ HP HR JH JK KA KL LA LD MH ML MN MP MZ NL "
+    "OD OR PB PY RJ SK TG TN TR TS UK UP UA WB".split())
+_REG_RE = re.compile(r"\b([A-Z]{2})[\s.-]?(\d{1,2})[\s.-]?([A-Z]{0,3})[\s.-]?(\d{4})\b")
+_BH_RE = re.compile(r"\b\d{2}[\s-]?BH[\s-]?\d{4}[\s-]?[A-Z]{1,2}\b")
+_VIN_RE = re.compile(r"\b(?=[A-HJ-NPR-Z0-9]*\d)(?=[A-HJ-NPR-Z0-9]*[A-Z])[A-HJ-NPR-Z0-9]{17}\b")
 
 _WARMED = False
 
@@ -105,12 +137,49 @@ def _verdict(expected, text):
     return "wrong", None
 
 
+def _has_vehicle_number(text):
+    """A registration mark (PB65AB1234, 22BH1234AA) or a 17-character chassis number."""
+    up = text.upper()
+    if any(m.group(1) in _STATE_CODES for m in _REG_RE.finditer(up)):
+        return True
+    return bool(_BH_RE.search(up) or _VIN_RE.search(up))
+
+
+def _rc_verdict(text):
+    """verified: reads like an RC. unreadable: a little of one (blurry or
+    cropped). wrong: something else; the detail says what, when it can
+    tell (an Aadhaar or PAN card, an insurance policy)."""
+    from ModelAdharPan.id_extractor import find_aadhaar_numbers, find_pan_numbers
+
+    def count(patterns):
+        return sum(bool(re.search(k, text, re.I)) for k in patterns)
+
+    words = count(_RC_KEYWORDS)
+    rc_only = count(_RC_ONLY)
+    number = _has_vehicle_number(text)
+
+    # A policy names the vehicle too (number, chassis, engine), so it is
+    # told apart by its own words and by lacking the RC's.
+    if not rc_only and count(_INSURANCE_KEYWORDS) >= 2:
+        return "wrong", "insurance"
+    if words >= 4 or (words >= 2 and number) or (rc_only and words >= 2):
+        return "verified", None
+    if words < 2:
+        if find_aadhaar_numbers(text):
+            return "wrong", "aadhaar"
+        if find_pan_numbers(text):
+            return "wrong", "pan"
+    if words >= 1 or number:
+        return "unreadable", None
+    return "wrong", None
+
+
 def check_upload(data, ext, doc_type):
     """Check one uploaded file and return only a verdict.
 
     Returns ``{"status": verified|unreadable|wrong|skipped|error, "detail": kind}``
-    where ``kind`` is, for "wrong", the card it looks like instead ("pan" or
-    "aadhaar") if it could tell, else None.
+    where ``kind`` is, for "wrong", the document it looks like instead ("pan",
+    "aadhaar" or "insurance") if it could tell, else None.
     """
     expected = _EXPECTED.get(doc_type)
     if expected is None:
@@ -126,11 +195,12 @@ def check_upload(data, ext, doc_type):
 
         from ModelAdharPan.id_extractor import ocr_image
 
-        status, detail = _verdict(expected, ocr_image(out))
-        log.info("Aadhaar/PAN check %s: %s", doc_type, status)
+        text = ocr_image(out)
+        status, detail = _rc_verdict(text) if expected == "rc" else _verdict(expected, text)
+        log.info("Document check %s: %s", doc_type, status)
         return {"status": status, "detail": detail}
     except Exception:
-        log.exception("Aadhaar/PAN auto-check failed (%s)", doc_type)
+        log.exception("Document auto-check failed (%s)", doc_type)
         return {"status": "error", "detail": None}
     finally:
         for path in (src, out):
@@ -150,6 +220,15 @@ def refuse_message(doc_type, result):
     from . import rules
 
     label = rules.DOC_TYPES.get(doc_type, {}).get("label", "document")
+    if _EXPECTED.get(doc_type) == "rc":
+        if result["status"] == "unreadable":
+            return ("We couldn't read this RC clearly. Upload a sharp, straight photo with "
+                    "the whole RC in view, or its PDF from DigiLocker or mParivahan.")
+        detail = result["detail"]
+        looks = f" It looks like {KIND_NAMES[detail]}." if detail in KIND_NAMES else ""
+        return (f"This doesn't look like the vehicle's {label}.{looks} Upload a clear, "
+                "straight photo of the RC (smart card or book), or its PDF from "
+                "DigiLocker or mParivahan.")
     if result["status"] == "unreadable":
         name = {"pan": "PAN", "aadhaar": "Aadhaar"}[_EXPECTED[doc_type]]
         return (f"We couldn't read a valid {name} number on this card. Upload a clear, "

@@ -24,7 +24,7 @@ from models import ListingDocument, Product, User
 from models.deal import DOC_APPROVED, DOC_REJECTED, DOC_UPLOADED
 from utils import current_user, is_superadmin  # noqa: F401
 from deals.service import is_doc_staff
-from deals import doc_storage, listing_docs as ld, rules
+from deals import doc_storage, id_verify, listing_docs as ld, rules
 from deals.service import Outbox, display_name, lender_financer_id, utcnow
 
 log = logging.getLogger("dealbridge.listing_docs")
@@ -207,6 +207,53 @@ def upload(pid, doc_type):
     if problem:
         return _err(problem, 400)
 
+    # Automatic check of the RC, decided on the spot like the buyer's PAN
+    # and Aadhaar: it reads like an RC ("verified", approved below) or it is
+    # refused here (a selfie, an Aadhaar card, the insurance policy, a photo
+    # too blurry to read), so the seller fixes it now. Only if the model
+    # cannot run does the file wait for a superadmin or the lender.
+    auto = None
+    if id_verify.checks(doc_type) and id_verify.enabled():
+        stream = request.files["file"].stream
+        try:
+            stream.seek(0)
+            auto = id_verify.check_upload(stream.read(size), ext, doc_type)
+        except Exception:
+            log.exception("Listing document auto-check could not run for %s", product.id)
+            auto = {"status": "error", "detail": None}
+        finally:
+            stream.seek(0)
+        if id_verify.refused(auto):
+            # Recorded on the row like a reviewer's rejection, so the seller
+            # sees "Rejected" and why; an earlier file of this type goes too.
+            message = id_verify.refuse_message(doc_type, auto)
+            doc = ListingDocument.query.filter_by(product_id=product.id, doc_type=doc_type).with_for_update().first()
+            before = ld.state(product)
+            now = utcnow()
+            old_key = doc.storage_key if doc is not None else None
+            if doc is None:
+                doc = ListingDocument(product_id=product.id, doc_type=doc_type, uploaded_by=user.id, uploaded_at=now)
+                db.session.add(doc)
+            doc.status = DOC_REJECTED
+            doc.storage_key = None
+            doc.deleted_at = now
+            doc.reviewed_by = None
+            doc.reviewed_financer_id = None
+            doc.reviewed_at = now
+            doc.reject_reason = message[:255]
+            db.session.flush()
+            ld.record_deal_event(product, "document_rejected", None, doc_type=doc_type,
+                                 reason=doc.reject_reason, by="model")
+            outbox = Outbox()
+            ld.after_change(product, before, user.id, outbox)
+            failed = _commit()
+            if failed:
+                return failed
+            if old_key and not ld.key_in_use_elsewhere(old_key, listing_doc_id=doc.id):
+                doc_storage.delete(old_key)
+            outbox.send()
+            return _err(message, 422)
+
     doc = ListingDocument.query.filter_by(product_id=product.id, doc_type=doc_type).with_for_update().first()
     before = ld.state(product)
     replaced_verified = doc is not None and doc.status == DOC_APPROVED and doc.deleted_at is None
@@ -239,6 +286,13 @@ def upload(pid, doc_type):
     doc.deleted_at = None
     db.session.flush()
     ld.record_deal_event(product, "document_uploaded", user.id, doc_type=doc_type)
+    # The model read an RC: approve it now. reviewed_by stays empty, so the
+    # record shows no person approved it.
+    if auto and auto.get("status") == "verified" and id_verify.auto_approve():
+        doc.status = DOC_APPROVED
+        doc.reviewed_at = now
+        db.session.flush()
+        ld.record_deal_event(product, "document_approved", None, doc_type=doc_type, by="model")
 
     outbox = Outbox()
     label = rules.DOC_TYPES[doc_type]["label"]
