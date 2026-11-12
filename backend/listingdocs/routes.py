@@ -5,6 +5,7 @@ DealLock phase 5: a listing's documents (the seller's, checked once).
                                                 superadmin / lender: listings to check
     GET  /api/listing-docs/<pid>                checklist (owner, superadmin, lender)
     POST /api/listing-docs/<pid>/loan-answer    owner: {had_loan: true|false}
+    POST /api/listing-docs/check/<type>         seller: model verdict before the ad exists (nothing stored)
     POST /api/listing-docs/<pid>/<type>         owner uploads (multipart "file")
     GET  /api/listing-docs/<pid>/files/<doc>    open one (superadmin, lender only)
     POST /api/listing-docs/<pid>/review/<doc>   superadmin / lender: {decision:
@@ -175,6 +176,33 @@ def loan_answer(pid):
             return failed
         outbox.send()
     return jsonify(ld.view(product, user))
+
+
+@bp.route("/check/<doc_type>", methods=["POST"])
+@jwt_required()
+def check(doc_type):
+    """Run the model on a document before the ad exists, so the Sell form
+    can say Verified or what's wrong as soon as the seller picks it.
+    Nothing is stored; the real upload after posting is checked again."""
+    user = _me()
+    if not user:
+        return _err("Please sign in again.", 401)
+    if doc_type not in rules.SELLER_DOC_TYPES or not id_verify.checks(doc_type):
+        return _err("That document isn't checked automatically.", 404)
+    if not id_verify.enabled():
+        return jsonify({"status": "error", "refused": False, "message": None})
+    ext, _content_type, size, problem = doc_storage.check_upload(
+        request.files.get("file"), rules.DOC_EXTENSIONS, rules.DOC_MAX_BYTES)
+    if problem:
+        return _err(problem, 400)
+    try:
+        result = id_verify.check_upload(request.files["file"].stream.read(size), ext, doc_type)
+    except Exception:
+        log.exception("Listing document pre-check could not run")
+        result = {"status": "error", "detail": None}
+    refused = id_verify.refused(result)
+    return jsonify({"status": result["status"], "refused": refused,
+                    "message": id_verify.refuse_message(doc_type, result) if refused else None})
 
 
 @bp.route("/<pid>/<doc_type>", methods=["POST"])

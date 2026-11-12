@@ -107,19 +107,15 @@ def build_product_query(args):
     if emi_only == "true":
         q = q.filter_by(emi_eligible=True)
 
-    # Two kinds of ordering.
+    # Nearness comes first in every sort mode: listings in the buyer's
+    # district, then the wider postal circle, then everywhere else. The
+    # chosen sort orders listings within each of those bands. Nothing is
+    # excluded, and it's done in SQL so it survives pagination.
     #
-    # "recommended" (the default, and what any client that sends no sort
-    # gets): promoted listings first, then title matches when searching,
-    # then listings near the buyer, then newest. This is the old default
-    # and the Android app's feed still relies on it.
-    #
-    # "newest", "price_asc", "price_desc": the buyer picked an order, so it
-    # IS the order. These used to be applied only after promotion and
-    # "near", so with an area selected the Newest/Price menu looked broken:
-    # a 45-day-old nearby listing sat above yesterday's, and a promoted
-    # listing sat above everything whatever the price. Nearness and age now
-    # only break ties.
+    # "recommended" (the default, and what the Android app's feed relies
+    # on): promoted listings first, then nearness, then title matches when
+    # searching, then newest. Promotion only reorders within the results
+    # the buyer's filters already selected.
     #
     # Product.id last everywhere, so pagination is stable when two rows tie.
     near = (args.get("near") or "").strip()
@@ -128,25 +124,22 @@ def build_product_query(args):
         (Product.city.like(f"{near[:2]}%"), 1),
         else_=2
     ) if near else None
+    order = [near_rank] if near_rank is not None else []
 
     if sort in ("price_asc", "price_desc"):
-        order = [Product.price.asc() if sort == "price_asc" else Product.price.desc()]
-        if near_rank is not None:
-            order.append(near_rank)
+        order.append(Product.price.asc() if sort == "price_asc" else Product.price.desc())
         order += [Product.created_at.desc(), Product.id]
         return q.order_by(*order)
 
     if sort == "newest":
-        return q.order_by(Product.created_at.desc(), Product.id)
+        order += [Product.created_at.desc(), Product.id]
+        return q.order_by(*order)
 
     # --- recommended ---
-    # Promoted listings sort above everything else, but ONLY within the
-    # results the buyer's filters already selected — paying to be seen must
-    # not put a fridge in front of someone searching for a phone.
-    order = [case((Product.featured_until > datetime.utcnow(), 0), else_=1)]
+    order.insert(0, case((Product.featured_until > datetime.utcnow(), 0), else_=1))
 
-    # Relevance next when searching: a listing whose TITLE matches should
-    # outrank one that merely mentions the term in its description.
+    # A listing whose TITLE matches should outrank one that merely
+    # mentions the term in its description.
     if search:
         primary = normalise(search)
         if len(primary) >= 2:
@@ -155,12 +148,6 @@ def build_product_query(args):
                 (_squash(Product.title).like(f"%{primary}%"), 1),  # title contains it
                 else_=2                                            # matched elsewhere
             ))
-
-    # "near" ranks results without excluding anything: listings in the
-    # buyer's district come first, then the wider postal circle, then
-    # everywhere else. Done in SQL so it survives pagination.
-    if near_rank is not None:
-        order.append(near_rank)
 
     order += [Product.created_at.desc(), Product.id]
     return q.order_by(*order)

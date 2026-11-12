@@ -29,6 +29,11 @@ CAPABILITIES = {
     # Dashboard / analytics
     "dashboard.view",
 
+    # Admin -> Analytics: visitor behaviour (clicks, CTR, dwell, devices,
+    # hashed IPs). In no role's defaults, so only superadmin sees it until
+    # a superadmin grants it to a role in Roles and permissions.
+    "analytics.view",
+
     # EMI applications
     "emi.view", "emi.review", "emi.delete",
 
@@ -150,7 +155,7 @@ SECTION_CAPABILITY = {
     "chatbot": "faqs.manage",
     "logs": "logs.view",
     "categories": "categories.manage",
-    "analytics": "dashboard.view",
+    "analytics": "analytics.view",
     "blog": "blog.manage",
     "terms": "legal.edit",
 }

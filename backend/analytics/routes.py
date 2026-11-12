@@ -1,8 +1,11 @@
 """Product analytics: what visitors look at, for Admin -> Analytics.
 
   POST /api/track                         the website (and later the app) sends events in batches
-  GET  /api/admin/analytics/summary       totals, CTR, dwell, devices, categories explored, per day
+  GET  /api/admin/analytics/summary       totals, CTR, dwell, devices, categories explored, per day/hour
   GET  /api/admin/analytics/products      per listing: impressions, clicks, CTR, visitors, dwell
+
+Both admin endpoints take ?days=N, or ?from=ISO&to=ISO for a custom window,
+and ?category=slug to narrow everything to one category.
 
 What is stored (models/analytics.py ProductEvent): event type, listing,
 category, dwell time, where on the site (source), a random per-tab session
@@ -17,7 +20,7 @@ import hashlib
 import hmac
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import case, distinct, func
@@ -155,21 +158,54 @@ def track():
 
 # ------------------------------------------------------------------ admin
 
-def _since():
-    """?days=N (default 30); days=0 means all time. Returns a datetime or None."""
+HOURLY_MAX = timedelta(days=2)
+
+
+def _parse_utc(value):
+    """ISO 8601 -> naive UTC datetime (created_at is stored as naive UTC)."""
+    dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _range():
+    """(since, until) as naive UTC datetimes, either may be None.
+
+    ?from=ISO&to=ISO picks a custom window (to defaults to now);
+    otherwise ?days=N (default 30), where days=0 means all time.
+    Raises ValueError with a message for the client on bad input."""
+    start, end = request.args.get("from"), request.args.get("to")
+    if start or end:
+        if not start:
+            raise ValueError("Pick a start date and time.")
+        try:
+            since = _parse_utc(start)
+            until = _parse_utc(end) if end else None
+        except ValueError:
+            raise ValueError("Dates must be ISO 8601, e.g. 2026-11-12T09:30:00Z.")
+        if until is not None and until <= since:
+            raise ValueError("The end must be after the start.")
+        return since, until
     try:
         days = int(request.args.get("days", 30))
     except (TypeError, ValueError):
         days = 30
     days = max(0, min(days, 3650))
-    return (datetime.utcnow() - timedelta(days=days)) if days else None
+    return ((datetime.utcnow() - timedelta(days=days)) if days else None), None
 
 
-def _base(since):
+def _iso(dt):
+    return dt.isoformat() + "Z" if dt else None
+
+
+def _base(since, until=None):
     from models import ProductEvent
     q = db.session.query(ProductEvent)
     if since is not None:
         q = q.filter(ProductEvent.created_at >= since)
+    if until is not None:
+        q = q.filter(ProductEvent.created_at < until)
     return q
 
 
@@ -178,29 +214,38 @@ def _ctr(clicks, impressions):
 
 
 @bp.route("/api/admin/analytics/summary", methods=["GET"])
-@require_capability("dashboard.view")
+@require_capability("analytics.view")
 def summary():
     from categories.util import label_for
     from models import ProductEvent as E
-    since = _since()
+    try:
+        since, until = _range()
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    cat = (request.args.get("category") or "").strip().lower()[:30]
+
+    def base():
+        q = _base(since, until)
+        return q.filter(E.category == cat) if cat else q
+
     imp = func.sum(case((E.event_type == "impression", 1), else_=0))
     clk = func.sum(case((E.event_type == "click", 1), else_=0))
     exp = func.sum(case((E.event_type == "category", 1), else_=0))
     dwell_avg = func.avg(case((E.event_type == "dwell", E.dwell_ms), else_=None))
 
-    t = _base(since).with_entities(imp, clk, func.count(distinct(E.ip_hash)), func.count(distinct(E.session_id)),
-                                   dwell_avg).one()
+    t = base().with_entities(imp, clk, func.count(distinct(E.ip_hash)), func.count(distinct(E.session_id)),
+                             dwell_avg).one()
     impressions, clicks = int(t[0] or 0), int(t[1] or 0)
     totals = {"impressions": impressions, "clicks": clicks, "ctr_pct": _ctr(clicks, impressions),
               "unique_visitors": int(t[2] or 0), "sessions": int(t[3] or 0),
               "avg_dwell_seconds": round(float(t[4]) / 1000, 1) if t[4] is not None else None}
 
     devices = [{"device": d or "unknown", "visitors": int(v or 0), "events": int(n or 0)}
-               for d, v, n in _base(since).with_entities(E.device_type, func.count(distinct(E.ip_hash)), func.count(E.id))
+               for d, v, n in base().with_entities(E.device_type, func.count(distinct(E.ip_hash)), func.count(E.id))
                .group_by(E.device_type).order_by(func.count(distinct(E.ip_hash)).desc()).all()]
 
     cats = []
-    for c, ex, vis, i, k, dw in (_base(since).with_entities(
+    for c, ex, vis, i, k, dw in (base().with_entities(
             E.category, exp, func.count(distinct(case((E.event_type == "category", E.ip_hash), else_=None))),
             imp, clk, dwell_avg)
             .filter(E.category.isnot(None)).group_by(E.category).all()):
@@ -210,45 +255,57 @@ def summary():
                      "avg_dwell_seconds": round(float(dw) / 1000, 1) if dw is not None else None})
     cats.sort(key=lambda x: (x["explored"] + x["clicks"]), reverse=True)
 
-    day = func.date(E.created_at)
-    daily = [{"day": str(d), "impressions": int(i or 0), "clicks": int(k or 0), "visitors": int(v or 0)}
-             for d, i, k, v in _base(since).with_entities(day, imp, clk, func.count(distinct(E.ip_hash)))
-             .group_by(day).order_by(day).all()]
+    # Up to two days: one point per hour (UTC, "at" as ISO so the page can
+    # show local time). Longer: one point per UTC day ("day").
+    hourly = since is not None and ((until or datetime.utcnow()) - since) <= HOURLY_MAX
+    bucket = func.date_format(E.created_at, "%Y-%m-%dT%H:00:00Z") if hourly else func.date(E.created_at)
+    key = "at" if hourly else "day"
+    daily = [{key: str(b), "impressions": int(i or 0), "clicks": int(k or 0), "visitors": int(v or 0)}
+             for b, i, k, v in base().with_entities(bucket, imp, clk, func.count(distinct(E.ip_hash)))
+             .group_by(bucket).order_by(bucket).all()]
 
     sources = [{"source": s or "direct", "clicks": int(n or 0)}
-               for s, n in _base(since).filter(E.event_type == "click")
+               for s, n in base().filter(E.event_type == "click")
                .with_entities(E.source, func.count(E.id)).group_by(E.source)
                .order_by(func.count(E.id).desc()).all()]
 
-    return jsonify({"since": since.isoformat() + "Z" if since else None, "totals": totals, "devices": devices,
+    return jsonify({"since": _iso(since), "until": _iso(until), "granularity": "hour" if hourly else "day",
+                    "totals": totals, "devices": devices,
                     "categories": cats, "daily": daily, "click_sources": sources})
 
 
 @bp.route("/api/admin/analytics/products", methods=["GET"])
-@require_capability("dashboard.view")
+@require_capability("analytics.view")
 def products():
     """Per listing, most clicked first (?sort=clicks|impressions|ctr|dwell,
     ?category=slug, ?limit=1..500)."""
     from models import Product
     from models import ProductEvent as E
-    since = _since()
+    try:
+        since, until = _range()
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
     imp = func.sum(case((E.event_type == "impression", 1), else_=0)).label("imp")
     clk = func.sum(case((E.event_type == "click", 1), else_=0)).label("clk")
     vis = func.count(distinct(case((E.event_type == "click", E.ip_hash), else_=None))).label("vis")
     dwell_avg = func.avg(case((E.event_type == "dwell", E.dwell_ms), else_=None)).label("dwavg")
     dwell_sum = func.sum(case((E.event_type == "dwell", E.dwell_ms), else_=0)).label("dwsum")
-    q = (_base(since).filter(E.product_id.isnot(None))
+    q = (_base(since, until).filter(E.product_id.isnot(None))
          .with_entities(E.product_id, imp, clk, vis, dwell_avg, dwell_sum).group_by(E.product_id))
     cat = (request.args.get("category") or "").strip().lower()
     if cat:
         q = q.filter(E.category == cat)
     sort = request.args.get("sort", "clicks")
-    order = {"impressions": imp.desc(), "dwell": dwell_sum.desc(), "clicks": clk.desc()}.get(sort, clk.desc())
+    # Tie-breakers so equal values still come out in a meaningful order.
+    order = {
+        "impressions": [imp.desc(), clk.desc()],
+        "dwell": [dwell_sum.desc(), clk.desc(), imp.desc()],
+    }.get(sort, [clk.desc(), imp.desc(), dwell_sum.desc()]) + [E.product_id]
     try:
         limit = max(1, min(int(request.args.get("limit", 100)), 500))
     except (TypeError, ValueError):
         limit = 100
-    rows = q.order_by(order).limit(limit if sort != "ctr" else 2000).all()
+    rows = q.order_by(*order).limit(limit if sort != "ctr" else 2000).all()
     info = {p.id: p for p in Product.query.filter(Product.id.in_([r[0] for r in rows])).all()} if rows else {}
     out = []
     for pid, i, k, v, da, ds in rows:
@@ -261,6 +318,7 @@ def products():
                     "avg_dwell_seconds": round(float(da) / 1000, 1) if da is not None else None,
                     "total_dwell_seconds": round(int(ds or 0) / 1000)})
     if sort == "ctr":
-        out.sort(key=lambda r: (r["ctr_pct"] or -1, r["impressions"]), reverse=True)
+        out.sort(key=lambda r: (r["ctr_pct"] if r["ctr_pct"] is not None else -1, r["clicks"], r["impressions"]),
+                 reverse=True)
         out = out[:limit]
-    return jsonify({"since": since.isoformat() + "Z" if since else None, "products": out})
+    return jsonify({"since": _iso(since), "until": _iso(until), "products": out})
