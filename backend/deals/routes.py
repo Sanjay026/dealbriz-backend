@@ -298,6 +298,9 @@ def send_offer():
     price, problem = rules.parse_price(data.get("price"))
     if problem:
         return _err(problem, 400)
+    problem = rules.offer_price_problem(price, product.price)
+    if problem:
+        return _err(problem, 400)
     note = (data.get("note") or "").strip()
     if len(note) > rules.MAX_NOTE_CHARS:
         return _err(f"Please keep the note under {rules.MAX_NOTE_CHARS} characters.", 400)
@@ -386,6 +389,9 @@ def counter_offer(offer_id):
         return _err(IN_A_DEAL, 409)
 
     price, problem = rules.parse_price(data.get("price"))
+    if problem:
+        return _err(problem, 400)
+    problem = rules.offer_price_problem(price, product.price)
     if problem:
         return _err(problem, 400)
     note = (data.get("note") or "").strip()
