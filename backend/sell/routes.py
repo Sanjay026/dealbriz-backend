@@ -182,9 +182,16 @@ def save_product_attributes(product, submitted):
 @bp.route("/attributes/<category>", methods=["GET"])
 def category_attributes(category):
     """Field definitions for a category, so the sell form renders the right
-    inputs without duplicating the list in JavaScript."""
-    from attributes import attributes_for
-    return jsonify({"category": category, "attributes": attributes_for(category)})
+    inputs without duplicating the list in JavaScript.
+
+    Also "brands": the Brand field's list for this category. Both the brands
+    and the dropdown choices come from Admin -> Categories -> Sell form lists
+    when an admin has edited them, else the defaults in attributes.py
+    (sell_options.py). "brands" is a new key: clients that don't read it are
+    unaffected."""
+    from sell_options import form_lists
+    brands, attributes = form_lists(category)
+    return jsonify({"category": category, "attributes": attributes, "brands": brands})
 
 
 @bp.route("/upload-image", methods=["POST"])

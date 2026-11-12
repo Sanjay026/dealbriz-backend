@@ -161,5 +161,5 @@ def check_upload(file_storage, extensions, max_bytes):
     if kind is None or kind not in extensions:
         return None, None, None, "Upload a photo (JPG, PNG or WEBP) or a PDF."
     if size > max_bytes:
-        return None, None, None, f"That file is too big. Files can be up to {max_bytes // (1024 * 1024)} MB."
+        return None, None, None, f"That file is too big. Files can be up to {max_bytes / (1024 * 1024):g} MB."
     return kind, extensions[kind], size, None

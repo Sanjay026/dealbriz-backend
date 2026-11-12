@@ -37,6 +37,11 @@ FURNISHING_OPTIONS = ["Unfurnished", "Semi-furnished", "Fully furnished"]
 # hardcoded — a fixed 2026 would start rejecting current-year listings the
 # moment the year rolls over, with nobody remembering why. +1 because
 # next-year models are advertised before the year begins.
+# A purchase can't be in the future, so "Year of purchase" stops at the
+# current calendar year (was a fixed 2026). Read when the backend starts,
+# like _YEAR's max below.
+_THIS_YEAR = datetime.now().year
+
 _YEAR = {
     "key": "year", "label": "Year of manufacture", "type": "number",
     "min": 1950, "max": datetime.now().year + 1, "placeholder": "e.g. 2018",
@@ -48,9 +53,11 @@ _KM = {
     "searchable": True, "aliases": ["km", "kms", "kilometre", "kilometer",
                                     "kilometres", "kilometers", "driven", "run", "odo"],
 }
+# allow_other: the sell form adds an "Other" choice that lets the seller
+# type a colour that isn't on the list.
 _COLOR = {
     "key": "color", "label": "Colour", "type": "select", "options": COLOR_OPTIONS,
-    "searchable": True, "aliases": ["colour", "color"],
+    "allow_other": True, "searchable": True, "aliases": ["colour", "color"],
 }
 _OWNERS = {
     "key": "owners", "label": "Number of owners", "type": "number",
@@ -83,13 +90,13 @@ CATEGORY_ATTRIBUTES = {
         {"key": "ram", "label": "RAM", "type": "select", "options": RAM_OPTIONS,
          "searchable": True, "aliases": ["ram"]},
         {"key": "year", "label": "Year of purchase", "type": "number",
-         "min": 2010, "max": 2026, "placeholder": "e.g. 2022",
+         "kind": "purchase_year", "min": 2010, "max": _THIS_YEAR, "placeholder": "e.g. 2022",
          "searchable": True, "aliases": ["year", "bought", "purchased"]},
     ],
     "electronics": [
         _COLOR,
         {"key": "year", "label": "Year of purchase", "type": "number",
-         "min": 2005, "max": 2026, "placeholder": "e.g. 2021",
+         "kind": "purchase_year", "min": 2005, "max": _THIS_YEAR, "placeholder": "e.g. 2021",
          "searchable": True, "aliases": ["year", "bought", "purchased"]},
         {"key": "warranty", "label": "Warranty remaining", "type": "select",
          "options": ["None", "Under 6 months", "6-12 months", "Over 1 year"],
@@ -106,7 +113,7 @@ CATEGORY_ATTRIBUTES = {
         {"key": "capacity", "label": "Capacity", "type": "text",
          "placeholder": "e.g. 250 L, 7 kg", "searchable": False},
         {"key": "year", "label": "Year of purchase", "type": "number",
-         "min": 2005, "max": 2026, "placeholder": "e.g. 2021",
+         "kind": "purchase_year", "min": 2005, "max": _THIS_YEAR, "placeholder": "e.g. 2021",
          "searchable": True, "aliases": ["year", "bought", "purchased"]},
     ],
     "property": [
@@ -124,6 +131,29 @@ CATEGORY_ATTRIBUTES = {
         {"key": "size", "label": "Size", "type": "text",
          "placeholder": "e.g. M, 42, UK 9", "searchable": True, "aliases": ["size"]},
     ],
+}
+
+
+# Default brand lists for the sell form's Brand field, per category. Admin ->
+# Categories -> "Sell form lists" can replace any of them (sell_options.py);
+# these are used until it does. Moved here from the website's app.js so the
+# website and the app get the same list from one place.
+DEFAULT_BRANDS = {
+    "cars": ["Maruti Suzuki", "Hyundai", "Tata", "Mahindra", "Honda", "Toyota", "Kia",
+             "Renault", "Volkswagen", "Skoda", "Ford", "MG", "Nissan", "Jeep",
+             "BMW", "Mercedes-Benz", "Audi", "Volvo"],
+    "bikes": ["Hero", "Honda", "Bajaj", "TVS", "Royal Enfield", "Yamaha", "Suzuki",
+              "KTM", "Jawa", "Ola Electric", "Ather", "Kawasaki", "Harley-Davidson"],
+    "phones": ["Samsung", "Apple", "Xiaomi", "Redmi", "Realme", "OnePlus", "Vivo",
+               "Oppo", "Poco", "Motorola", "Nothing", "Google", "iQOO", "Infinix", "Tecno"],
+    "electronics": ["HP", "Dell", "Lenovo", "Asus", "Acer", "Apple", "MSI", "Sony",
+                    "LG", "Samsung", "Canon", "Nikon", "JBL", "boAt", "Logitech"],
+    "appliances": ["LG", "Samsung", "Whirlpool", "Godrej", "Voltas", "Haier", "IFB",
+                   "Bosch", "Panasonic", "Blue Star", "Hitachi", "Philips", "Prestige", "Bajaj"],
+    "furniture": ["IKEA", "Godrej Interio", "Nilkamal", "Pepperfry", "Urban Ladder",
+                  "Durian", "Sleepwell", "Wakefit", "HomeTown", "Damro"],
+    "fashion": ["Nike", "Adidas", "Puma", "Levi's", "H&M", "Zara", "Uniqlo", "US Polo Assn",
+                "Allen Solly", "Peter England", "Woodland", "Bata", "Titan", "Fastrack"],
 }
 
 

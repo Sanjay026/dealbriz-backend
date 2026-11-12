@@ -7,11 +7,17 @@
   POST   /api/admin/categories/reorder     {slugs: [...]} in the new order
   DELETE /api/admin/categories/<slug>      only when no listing has ever used it
 
+  GET    /api/admin/sell-options           the sell form's editable lists (brands
+                                           per category, dropdown choices)
+  PUT    /api/admin/sell-options/<key>     {values: [...]} replaces one list
+  DELETE /api/admin/sell-options/<key>     back to the default list
+  (sell_options.py; same capability as the categories)
+
 The slug can't change: it's stored on every listing and in /category/ URLs.
 """
 import re
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import func
 
 from extensions import db
@@ -173,3 +179,55 @@ def admin_delete(slug):
     db.session.commit()
     util.clear_cache()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------- sell form lists
+
+def _lists_unavailable():
+    current_app.logger.error("sell_option_lists write failed", exc_info=True)
+    return jsonify({"error": "Could not save. If this is the first time, run "
+                             "ddb/migration_sell_options.sql on the database."}), 503
+
+
+@bp.route("/api/admin/sell-options", methods=["GET"])
+@require_capability("categories.manage")
+def admin_sell_options():
+    import sell_options
+    return jsonify({"lists": sell_options.admin_lists(),
+                    "value_max": sell_options.VALUE_MAX, "list_max": sell_options.LIST_MAX})
+
+
+@bp.route("/api/admin/sell-options/<list_key>", methods=["PUT"])
+@require_capability("categories.manage")
+def admin_sell_options_save(list_key):
+    import sell_options
+    from utils import current_user
+    if not sell_options.known_key(list_key):
+        return jsonify({"error": "Unknown list."}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        values = sell_options.clean_values(data.get("values"))
+    except sell_options.ListError as exc:
+        return jsonify({"error": exc.message}), 400
+    user = current_user()
+    try:
+        sell_options.save_list(list_key, values, user.id if user else None)
+    except Exception:
+        db.session.rollback()
+        return _lists_unavailable()
+    return jsonify({"key": list_key, "values": values, "edited": True})
+
+
+@bp.route("/api/admin/sell-options/<list_key>", methods=["DELETE"])
+@require_capability("categories.manage")
+def admin_sell_options_reset(list_key):
+    import sell_options
+    if not sell_options.known_key(list_key):
+        return jsonify({"error": "Unknown list."}), 404
+    try:
+        sell_options.reset_list(list_key)
+    except Exception:
+        db.session.rollback()
+        return _lists_unavailable()
+    item = next((x for x in sell_options.admin_lists() if x["key"] == list_key), None)
+    return jsonify(item or {"key": list_key})

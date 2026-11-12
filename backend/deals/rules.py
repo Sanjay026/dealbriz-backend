@@ -125,7 +125,11 @@ PERSONAL_DOCS = tuple(d for d in _list_env("DEALLOCK_PERSONAL_DOCS", "")
                       if d in DOC_TYPES and DOC_PARTY[d] == "seller")
 BUYER_DOCS = tuple(d for d in _list_env("DEALLOCK_BUYER_DOCS", "buyer_pan,buyer_aadhaar")
                    if d in DOC_TYPES and DOC_PARTY[d] == "buyer")
-DOC_MAX_BYTES = 8 * 1024 * 1024
+# Every document (listing RC/insurance/NOC, a buyer's PAN/Aadhaar, deal
+# documents): at most 1.5 MB each. Was 8 MB. The website shrinks photos to
+# fit before uploading; a bigger PDF is refused.
+DOC_MAX_MB = 1.5
+DOC_MAX_BYTES = int(DOC_MAX_MB * 1024 * 1024)
 DOC_EXTENSIONS = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                   "webp": "image/webp", "pdf": "application/pdf"}
 
@@ -159,7 +163,7 @@ def public_rules():
         "loan_rate_min": LOAN_RATE_MIN,
         "loan_rate_max": LOAN_RATE_MAX,
         "loan_tenures": list(LOAN_TENURES),
-        "doc_max_mb": DOC_MAX_BYTES // (1024 * 1024),
+        "doc_max_mb": DOC_MAX_MB,
         "doc_extensions": sorted(DOC_EXTENSIONS),
     }
 

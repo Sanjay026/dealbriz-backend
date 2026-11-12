@@ -107,10 +107,15 @@ def build_product_query(args):
     if emi_only == "true":
         q = q.filter_by(emi_eligible=True)
 
-    # Nearness comes first in every sort mode: listings in the buyer's
-    # district, then the wider postal circle, then everywhere else. The
-    # chosen sort orders listings within each of those bands. Nothing is
-    # excluded, and it's done in SQL so it survives pagination.
+    # Nearness (the buyer's district, then the wider postal circle, then
+    # everywhere else) ranks listings without excluding any, in SQL so it
+    # survives pagination.
+    #
+    # Newest and Price are strict orders: the order the buyer picked comes
+    # FIRST and nearness only breaks ties. Nearness used to come first in
+    # every mode, so with an area chosen "Newest" showed a 59-day-old
+    # nearby listing above a 9-day-old one further away, and Price jumped
+    # back down at each band; the sort looked broken.
     #
     # "recommended" (the default, and what the Android app's feed relies
     # on): promoted listings first, then nearness, then title matches when
@@ -124,16 +129,18 @@ def build_product_query(args):
         (Product.city.like(f"{near[:2]}%"), 1),
         else_=2
     ) if near else None
-    order = [near_rank] if near_rank is not None else []
+    near_order = [near_rank] if near_rank is not None else []
 
     if sort in ("price_asc", "price_desc"):
-        order.append(Product.price.asc() if sort == "price_asc" else Product.price.desc())
-        order += [Product.created_at.desc(), Product.id]
+        order = [Product.price.asc() if sort == "price_asc" else Product.price.desc()]
+        order += near_order + [Product.created_at.desc(), Product.id]
         return q.order_by(*order)
 
     if sort == "newest":
-        order += [Product.created_at.desc(), Product.id]
+        order = [Product.created_at.desc()] + near_order + [Product.id]
         return q.order_by(*order)
+
+    order = list(near_order)
 
     # --- recommended ---
     order.insert(0, case((Product.featured_until > datetime.utcnow(), 0), else_=1))
@@ -296,9 +303,12 @@ def smart_search():
     # stricter one looked like a broken search. Now both rank by distance
     # and neither hides a listing for being a postcode away.
     pincode = (request.args.get("pincode") or "").strip()
+    # Optional: newest / price_asc / price_desc, as on /api/buy. Without it
+    # (the app, older website builds) the order is relevance, as before.
+    sort = (request.args.get("sort") or "").strip().lower()
 
     result = search_listings(raw, page=page, per_page=per_page,
-                             near_pincode=pincode or None)
+                             near_pincode=pincode or None, sort=sort or None)
     items = [p.to_dict() for p in result.pop("items")]
     return jsonify({"items": items, **result})
 

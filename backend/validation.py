@@ -22,6 +22,15 @@ PLACE_MAX = 200          # products.location / landmark
 BRAND_MAX = 100          # products.brand / model
 NAME_MAX = 80            # same as signup
 PRICE_MAX = 99999999
+# A listing's asking price, every category: at least Rs 5,000 and at most
+# Rs 1,00,00,000 (one crore). Checked when a listing is posted and whenever
+# an edit changes the price; an older listing outside the range can still
+# be edited as long as its price is left as it is.
+LISTING_PRICE_MIN = 5000
+LISTING_PRICE_MAX = 10000000
+# Description length in words, checked the same way (new listing, or an
+# edit that changes the description).
+DESCRIPTION_MAX_WORDS = 100
 MAX_EXTRA_IMAGES = 20
 LISTING_STATUSES = ("active", "sold", "removed", "reserved")
 
@@ -87,6 +96,44 @@ def money(value, label, required=True):
     if n > PRICE_MAX:
         raise Invalid(f"The {label} is too large.")
     return n
+
+
+def _differs(new_price, old_price):
+    """True when an edit changes the price (the stored value is a Decimal)."""
+    if old_price is None:
+        return True
+    try:
+        return abs(float(new_price) - float(old_price)) >= 0.005
+    except (TypeError, ValueError):
+        return True
+
+
+def _inr(n):
+    """Whole rupees with Indian grouping: 10000000 -> "1,00,00,000"."""
+    digits = str(int(n))
+    if len(digits) <= 3:
+        return digits
+    head, tail = digits[:-3], digits[-3:]
+    groups = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        groups.insert(0, head)
+    return ",".join(groups + [tail])
+
+
+def listing_price(n):
+    """A listing's asking price must be within LISTING_PRICE_MIN..MAX."""
+    if n < LISTING_PRICE_MIN:
+        raise Invalid(f"The price must be at least \u20b9{_inr(LISTING_PRICE_MIN)}.")
+    if n > LISTING_PRICE_MAX:
+        raise Invalid(f"The price can't be more than \u20b9{_inr(LISTING_PRICE_MAX)}.")
+    return n
+
+
+def word_count(text):
+    return len(str(text or "").split())
 
 
 def flag(value):
@@ -192,11 +239,18 @@ def clean_listing(data, product=None):
         out["condition"] = code(data.get("condition"), "condition")
     if has("price"):
         out["price"] = money(data.get("price"), "price")
+        if creating or _differs(out["price"], product.price):
+            listing_price(out["price"])
     if "original_price" in data:
         out["original_price"] = money(data.get("original_price"), "original price", required=False)
     if has("description"):
         out["description"] = long_text(data.get("description"), "description",
                                        DESCRIPTION_MAX, required=True)
+        if creating or out["description"] != (product.description or "").strip():
+            words = word_count(out["description"])
+            if words > DESCRIPTION_MAX_WORDS:
+                raise Invalid(f"Please keep the description to {DESCRIPTION_MAX_WORDS} words "
+                              f"or fewer (it has {words}).")
     if has("city"):
         out["city"] = pincode(data.get("city"))
     for key, label, cap in (("location", "location", PLACE_MAX), ("landmark", "landmark", PLACE_MAX),

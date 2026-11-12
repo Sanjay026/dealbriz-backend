@@ -208,7 +208,21 @@ def apply_relaxation(parsed, step):
     return p
 
 
-def search_listings(raw, page=1, per_page=30, base_filters=None, near_pincode=None):
+def sorted_order(query, sort, first_key=None):
+    """The buyer's chosen order (Newest, Price low to high, Price high to
+    low) for search results: that order first, nearness only breaking ties,
+    as on /api/buy. Returns None for "recommended" or anything unknown, so
+    the caller keeps the relevance order."""
+    lead = [first_key] if first_key is not None else []
+    if sort == "newest":
+        return query.order_by(Product.created_at.desc(), *lead, Product.id)
+    if sort in ("price_asc", "price_desc"):
+        price = Product.price.asc() if sort == "price_asc" else Product.price.desc()
+        return query.order_by(price, *lead, Product.created_at.desc(), Product.id)
+    return None
+
+
+def search_listings(raw, page=1, per_page=30, base_filters=None, near_pincode=None, sort=None):
     """Runs a natural-language search.
 
     Returns the results plus what was understood, so the UI can show the
@@ -231,8 +245,11 @@ def search_listings(raw, page=1, per_page=30, base_filters=None, near_pincode=No
             # Outer join: a listing whose pincode is missing from the India
             # Post table still appears, ranked last, rather than vanishing.
             q = q.outerjoin(places, places.c.pincode == Product.city)
-            return relevance_order(q, p, first_key=proximity_rank(places, ctx))
-        return relevance_order(q, p)
+            rank = proximity_rank(places, ctx)
+            chosen = sorted_order(q, sort, rank)
+            return chosen if chosen is not None else relevance_order(q, p, first_key=rank)
+        chosen = sorted_order(q, sort)
+        return chosen if chosen is not None else relevance_order(q, p)
 
     query = build(parsed)
     total = query.count()

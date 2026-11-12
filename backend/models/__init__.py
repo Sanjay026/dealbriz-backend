@@ -19,6 +19,7 @@ Models package — one module per domain, mirroring the blueprint folders.
     push_device.py   PushDevice
     category.py      Category (Admin -> Categories)
     analytics.py     ProductEvent (Admin -> Analytics), ProductView (unique views)
+    sell_option.py   SellOptionList (Admin -> Categories -> Sell form lists)
     deal.py          DealOffer, Deal, DealEvent, LoanStatusEvent, ListingDocument, DealLenderEmail,
                      DealDocument, OtpCode (DealLock)
 
@@ -59,6 +60,7 @@ from .deal import (DealOffer, Deal, DealEvent, LoanStatusEvent, DealDocument, Li
                    OtpCode)
 from .category import Category
 from .analytics import ProductEvent, ProductView
+from .sell_option import SellOptionList
 
 __all__ = [
     "gen_id",
@@ -83,4 +85,5 @@ __all__ = [
     "PushDevice",
     "DealOffer", "Deal", "DealEvent", "LoanStatusEvent", "DealDocument", "ListingDocument", "DealLenderEmail", "OtpCode",
     "Category", "ProductEvent", "ProductView",
+    "SellOptionList",
 ]
