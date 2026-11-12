@@ -25,6 +25,10 @@ def submit_emi():
     return jsonify(emi.to_dict()), 201
 
 
+# How the applicant earns (emi_applications.employment_type).
+EMPLOYMENT_TYPES = ("salaried", "self_employed")
+
+
 def build_emi_application(user, data, price_override=None):
     """Validates an application and returns (EmiApplication, None), not yet
     added to the session, or (None, error_response).
@@ -111,6 +115,10 @@ def build_emi_application(user, data, price_override=None):
         return None, (jsonify({"error": "The down payment must be less than the price."}), 400)
     if income is not None and not (0 <= income <= 1e9):
         return None, (jsonify({"error": "The monthly income isn't valid."}), 400)
+    # Optional: forms that don't ask (the website's) send nothing.
+    employment = (str(data.get("employment_type") or "")).strip().lower() or None
+    if employment is not None and employment not in EMPLOYMENT_TYPES:
+        return None, (jsonify({"error": "Choose salaried or self-employed."}), 400)
     loan = round(price - down)
     monthly, total = rules.emi_estimate(loan, tenure, rate)
 
@@ -121,7 +129,7 @@ def build_emi_application(user, data, price_override=None):
         interest_rate=rate, loan_amount=loan,
         monthly_emi=monthly, total_payable=total,
         applicant_name=name[:200], applicant_phone=phone[:20],
-        applicant_income=income, status="pending"
+        applicant_income=income, employment_type=employment, status="pending"
     )
     return emi, None
 

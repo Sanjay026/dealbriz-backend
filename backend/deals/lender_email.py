@@ -47,6 +47,8 @@ STUCK_MINUTES = 15
 MAX_ADDRESSES = 3
 _EMAIL_RE = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[A-Za-z]{2,}$")
 EXT = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+# emi_applications.employment_type, as the lender reads it.
+_EMPLOYMENT = {"salaried": "Salaried", "self_employed": "Self-employed"}
 
 
 # --------------------------------------------------------------------------
@@ -402,6 +404,7 @@ def compose(row):
             ("Applicant", app.applicant_name),
             ("Applicant phone", app.applicant_phone),
             ("Monthly income (stated)", money(app.applicant_income)),
+            ("Employment (stated)", _EMPLOYMENT.get(app.employment_type or "", "Not stated")),
             ("Loan type", "Vehicle loan" if vehicle else "Personal loan"),
             ("Agreed price", money(deal.agreed_price)),
             ("Down payment", money(app.down_payment)),

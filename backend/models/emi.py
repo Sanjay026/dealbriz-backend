@@ -24,6 +24,9 @@ class EmiApplication(db.Model):
     applicant_name = db.Column(db.String(200), nullable=False)
     applicant_phone = db.Column(db.String(20), nullable=False)
     applicant_income = db.Column(db.Numeric(12, 2))
+    # "salaried" or "self_employed" (the app's DealLock loan form asks).
+    # Empty for older applications. ddb/migration_employment_type.sql
+    employment_type = db.Column(db.String(20))
     status = db.Column(db.String(20), default="pending")
     # Archived applications stay in the DB (loan terms are an audit record and
     # a purchase may reference them) but drop out of the default admin view.
@@ -60,6 +63,7 @@ class EmiApplication(db.Model):
             "total_payable": float(self.total_payable),
             "applicant_name": self.applicant_name, "applicant_phone": self.applicant_phone,
             "applicant_income": float(self.applicant_income) if self.applicant_income else None,
+            "employment_type": self.employment_type,
             "status": self.status,
             "is_archived": bool(self.is_archived),
             "applied_at": iso_utc(self.applied_at),
