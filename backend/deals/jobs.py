@@ -22,6 +22,9 @@ What it does each run:
   - document files of deals closed more than 30 days ago -> deleted, and
     listing document files (the seller's) of listings sold or removed, once
     30 days old and no deal on the listing closed in the last 30 days
+  - 24 hours after the buyer applied for the loan -> the buyer is asked
+    "Did you get your loan?" (email, bell, push), and 4 days after -> both
+    sides are asked "Is your deal done?" (deals/done_check.py)
 
 It is safe to run twice at once or to miss a run: rows are claimed with
 SELECT ... FOR UPDATE SKIP LOCKED, and the routes already treat a lapsed
@@ -39,6 +42,7 @@ def run():
     from app import app
     from extensions import db
     from deals.listing_docs import purge_listing_documents
+    from deals.done_check import send_done_checks, send_emails, send_loan_checks
     from deals.service import (Outbox, expire_cancel_requests, expire_offers, flag_stalled_loans,
                                lock_ready_deals, purge_closed_deal_documents,
                                release_expired_reservations, release_unconfirmed,
@@ -48,6 +52,7 @@ def run():
     with app.app_context():
         now = utcnow()
         expired = released = unconfirmed = stalled = purged = lapsed = locked = mailed = 0
+        loan_checks = done_checks = check_mails = 0
         threads = []
         try:
             # Batches keep each transaction short. Loop until a batch comes
@@ -92,6 +97,21 @@ def run():
                 lapsed += n
                 if n < 200:
                     break
+            # "Did you get your loan?" (24 h) and "Is your deal done?" (4 days).
+            # The emails go out after each batch is committed.
+            for sender in (send_loan_checks, send_done_checks):
+                while True:
+                    outbox = Outbox()
+                    n, emails = sender(now, outbox)
+                    db.session.commit()
+                    threads += outbox.send()
+                    check_mails += send_emails(emails)
+                    if sender is send_loan_checks:
+                        loan_checks += n
+                    else:
+                        done_checks += n
+                    if n < 100:
+                        break
             # Documents emails to lenders: waiting, failed or stuck ones.
             from deals.lender_email import send_due
             mailed = send_due(now)
@@ -112,7 +132,8 @@ def run():
         msg = (f"DealLock timers: {locked} deal(s) locked, {expired} offer(s) expired, {unconfirmed} unconfirmed deal(s) "
                f"released, {released} deal(s) released, {lapsed} cancel request(s) lapsed, "
                f"{stalled} stalled loan(s) flagged, {mailed} lender email(s) sent, "
-               f"{purged} document file(s) deleted")
+               f"{purged} document file(s) deleted, {loan_checks} loan check(s) and "
+               f"{done_checks} deal-done check(s) sent ({check_mails} email(s))")
         log.info(msg)
         print(msg)
         return 0

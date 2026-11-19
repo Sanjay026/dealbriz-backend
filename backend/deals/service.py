@@ -1214,9 +1214,14 @@ def lock_ready_deals(now, outbox, batch=100):
 def release_expired_reservations(now, outbox, batch=100):
     """Deals still before Ready to pay when the reservation runs out are
     released, and the listing goes back on sale. That includes deals whose
-    documents weren't approved in time."""
+    documents weren't approved in time.
+
+    Not a deal where the buyer or the seller has already said the deal is
+    done (deals/done_check.py): money may have moved, so it waits for the
+    other side's answer (or staff) instead of being put back on sale."""
     deals = (Deal.query
-             .filter(Deal.status.in_(TIMED_STATES), Deal.reserved_until <= now)
+             .filter(Deal.status.in_(TIMED_STATES), Deal.reserved_until <= now,
+                     Deal.buyer_done_at.is_(None), Deal.seller_done_at.is_(None))
              .order_by(Deal.reserved_until)
              .limit(batch)
              .with_for_update(skip_locked=True)

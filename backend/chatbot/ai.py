@@ -68,19 +68,19 @@ def enabled():
     return not key_env or bool(os.environ.get(key_env, "").strip())
 
 
-def _llm(timeout):
+def _llm(timeout, temperature=0.2):
     p = provider()
     conf = PROVIDERS[p]
     model = os.environ.get("LLM_MODEL", "").strip() or conf["model"]
     if p == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(model=model, temperature=0.2, num_predict=MAX_TOKENS,
+        return ChatOllama(model=model, temperature=temperature, num_predict=MAX_TOKENS,
                           base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
                           client_kwargs={"timeout": timeout})
     from langchain_openai import ChatOpenAI
     # xAI and Groq both speak the OpenAI API, so one client covers both.
     return ChatOpenAI(model=model, api_key=os.environ.get(conf["key_env"], "").strip(),
-                      base_url=conf["base_url"], temperature=0.2, max_tokens=MAX_TOKENS,
+                      base_url=conf["base_url"], temperature=temperature, max_tokens=MAX_TOKENS,
                       timeout=timeout, max_retries=1)
 
 
@@ -347,9 +347,14 @@ def _clean_history(history):
     return out
 
 
-def answer(message, user=None, pincode=None, history=None):
+def answer(message, user=None, pincode=None, history=None, lessons="", retry=False):
     """{"reply", "action", "tools"} or None (AI off, or it failed: the
-    caller falls back to the rule-based bot)."""
+    caller falls back to the rule-based bot).
+
+    lessons: text built from users' thumbs up/down on earlier answers to
+    this question (chatbot/feedback.py lessons_prompt), added to the
+    instructions so a disliked answer isn't given again. retry: "Ask
+    again" after a thumbs down; a little more variety in the wording."""
     if not enabled():
         return None
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -360,7 +365,7 @@ def answer(message, user=None, pincode=None, history=None):
     try:
         tools = build_tools(user, pincode)
         by_name = {t.name: t for t in tools}
-        msgs = [SystemMessage(content=_system_prompt(user))]
+        msgs = [SystemMessage(content=_system_prompt(user) + (lessons or ""))]
         for role, text in _clean_history(history):
             msgs.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))
         msgs.append(HumanMessage(content=message))
@@ -372,7 +377,7 @@ def answer(message, user=None, pincode=None, history=None):
                 if left < 2:
                     log.warning("AI answer ran out of time after %d steps", step)
                     return None
-                llm = _llm(min(per_call, left))
+                llm = _llm(min(per_call, left), temperature=0.6 if retry else 0.2)
                 # On the last round, no tools: the model must answer now.
                 bound = llm.bind_tools(tools) if step < MAX_STEPS else llm
                 reply = bound.invoke(msgs)

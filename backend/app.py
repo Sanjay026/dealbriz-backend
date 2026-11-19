@@ -109,11 +109,12 @@ def create_app():
     from seo.routes import bp as seo_bp
     from categories.routes import bp as categories_bp   # /api/categories, Admin -> Categories
     from analytics.routes import bp as analytics_bp     # /api/track, Admin -> Analytics
+    from deals.done_check import bp as deal_done_bp     # /api/deals/<id>/done, email answers, docs consent
 
     for blueprint in (
         auth_bp, buy_bp, sell_bp, mylistings_bp, profile_bp,
         saved_bp, chat_bp, emi_bp, financers_bp, admin_bp, reports_bp, legal_bp, faqs_bp, blog_bp, settings_bp, logs_bp, locations_bp, chatbot_bp, notifications_bp, deals_bp, loans_bp, lender_bp,
-        listing_docs_bp, seo_bp, categories_bp, analytics_bp
+        listing_docs_bp, seo_bp, categories_bp, analytics_bp, deal_done_bp
     ):
         app.register_blueprint(blueprint)
 

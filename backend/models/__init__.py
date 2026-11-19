@@ -20,6 +20,7 @@ Models package — one module per domain, mirroring the blueprint folders.
     category.py      Category (Admin -> Categories)
     analytics.py     ProductEvent (Admin -> Analytics), ProductView (unique views)
     sell_option.py   SellOptionList (Admin -> Categories -> Sell form lists)
+    chatbot_feedback.py  ChatbotQuestion, ChatbotFeedback (thumbs up/down on bot answers)
     deal.py          DealOffer, Deal, DealEvent, LoanStatusEvent, ListingDocument, DealLenderEmail,
                      DealDocument, OtpCode (DealLock)
 
@@ -61,6 +62,7 @@ from .deal import (DealOffer, Deal, DealEvent, LoanStatusEvent, DealDocument, Li
 from .category import Category
 from .analytics import ProductEvent, ProductView
 from .sell_option import SellOptionList
+from .chatbot_feedback import ChatbotQuestion, ChatbotFeedback
 
 __all__ = [
     "gen_id",
@@ -86,4 +88,5 @@ __all__ = [
     "DealOffer", "Deal", "DealEvent", "LoanStatusEvent", "DealDocument", "ListingDocument", "DealLenderEmail", "OtpCode",
     "Category", "ProductEvent", "ProductView",
     "SellOptionList",
+    "ChatbotQuestion", "ChatbotFeedback",
 ]

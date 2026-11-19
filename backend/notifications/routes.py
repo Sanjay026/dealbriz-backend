@@ -76,3 +76,57 @@ def mark_read():
     updated = q.update({"is_read": True}, synchronize_session=False)
     db.session.commit()
     return jsonify({"ok": True, "updated": int(updated or 0)})
+
+
+# ---------------------------------------------------------------- delete
+# The app (since 1.2.9) and the website delete notifications. Every delete
+# is scoped to the caller's own user_id, so an id belonging to someone else
+# matches nothing. Deleting is permanent: the row is gone, not hidden.
+
+MAX_DELETE_IDS = 200
+
+
+@bp.route("", methods=["DELETE"])
+@jwt_required()
+def delete_all():
+    """Clears the caller's whole notification feed."""
+    user = current_user()
+    deleted = (Notification.query
+               .filter(Notification.user_id == user.id)
+               .delete(synchronize_session=False))
+    db.session.commit()
+    return jsonify({"ok": True, "deleted": int(deleted or 0)})
+
+
+@bp.route("/delete", methods=["POST"])
+@jwt_required()
+def delete_selected():
+    """{ids: [...]}: deletes the chosen notifications (the website's
+    "Delete selected"). Ids that aren't the caller's are ignored."""
+    user = current_user()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids")
+    if not isinstance(ids, list):
+        return jsonify({"error": "Choose the notifications to delete."}), 400
+    ids = [str(i)[:36] for i in ids if isinstance(i, (str, int)) and str(i).strip()][:MAX_DELETE_IDS]
+    if not ids:
+        return jsonify({"error": "Choose the notifications to delete."}), 400
+    deleted = (Notification.query
+               .filter(Notification.user_id == user.id, Notification.id.in_(ids))
+               .delete(synchronize_session=False))
+    db.session.commit()
+    return jsonify({"ok": True, "deleted": int(deleted or 0)})
+
+
+@bp.route("/<nid>", methods=["DELETE"])
+@jwt_required()
+def delete_one(nid):
+    """Deletes one notification. Already gone (or not the caller's) is 404."""
+    user = current_user()
+    deleted = (Notification.query
+               .filter(Notification.user_id == user.id, Notification.id == str(nid)[:36])
+               .delete(synchronize_session=False))
+    db.session.commit()
+    if not deleted:
+        return jsonify({"error": "Notification not found."}), 404
+    return jsonify({"ok": True, "deleted": 1})

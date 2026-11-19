@@ -66,6 +66,11 @@ TIMED_STATES = (DEAL_DOCS_PENDING, DEAL_LOCKED, DEAL_LOAN_IN_PROGRESS)
 # before the seller can confirm.
 BUYER_NOTICE_STATES = (DEAL_AWAITING_SELLER,)
 
+# "Did you get the loan?" / "Is your deal done?" (deals/done_check.py): asked
+# from 24 hours after the loan was applied for, in these states. The buyer's
+# yes and the seller's yes together complete the deal.
+DONE_CHECK_STATES = (DEAL_LOAN_IN_PROGRESS, DEAL_READY_TO_PAY, DEAL_PAID)
+
 # Loan types. Vehicle for the vehicle categories, personal for the rest.
 LOAN_VEHICLE = "vehicle"
 LOAN_PERSONAL = "personal"
@@ -212,6 +217,13 @@ class Deal(db.Model):
     cancel_requested_at = db.Column(db.DateTime)
     cancel_request_expires_at = db.Column(db.DateTime)
     cancel_request_reason = db.Column(db.String(255))
+    # "Did you get the loan?" (buyer, 24 h after applying) and "Is your deal
+    # done?" (both, 4 days after) - deals/done_check.py,
+    # ddb/migration_deal_done_check.sql. Both *_done_at set = completed.
+    loan_check_sent_at = db.Column(db.DateTime)
+    done_check_sent_at = db.Column(db.DateTime)
+    buyer_done_at = db.Column(db.DateTime)
+    seller_done_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -270,6 +282,11 @@ class Deal(db.Model):
             # force cancel, which counts towards the pause).
             "cancel_needs_agreement": self.status in CONFIRMED_STATES,
             "cancel_request": None,
+            # Deal-done confirmation (deals/done_check.py). Additive keys.
+            "loan_check_sent_at": iso_utc(self.loan_check_sent_at),
+            "done_check_sent_at": iso_utc(self.done_check_sent_at),
+            "buyer_done_at": iso_utc(self.buyer_done_at),
+            "seller_done_at": iso_utc(self.seller_done_at),
         }
         req = self.has_cancel_request
         if req:
@@ -297,6 +314,15 @@ class Deal(db.Model):
             d["can_acknowledge"] = (d["my_role"] == "buyer" and d["waiting_for_buyer_ack"])
             d["can_confirm"] = (d["my_role"] == "seller" and self.status == DEAL_AWAITING_SELLER
                                 and self.buyer_ack_at is not None)
+            # "Confirm the deal is done" card: from the moment the buyer was
+            # asked about the loan (24 h after applying), until this side
+            # has said yes.
+            mine_done = (self.buyer_done_at if d["my_role"] == "buyer"
+                         else self.seller_done_at if d["my_role"] == "seller" else None)
+            d["can_confirm_done"] = bool(party and self.status in DONE_CHECK_STATES
+                                         and self.loan_check_sent_at is not None
+                                         and mine_done is None)
+            d["my_done_at"] = iso_utc(mine_done)
             # The handover code is the buyer's alone: the seller types it in
             # at the handover, which proves the buyer was there and agreed.
             if (d["my_role"] == "buyer" and self.handover_code
